@@ -9,8 +9,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = [Version] '1.11.10'
-$CurrentConfigVersion = 8
+$ScriptVersion = [Version] '1.14.4'
+$CurrentConfigVersion = 11
 $LegacyConfigVersion = 1
 $ConfigFileName = 'prepare-nouveau-projet.config.json'
 $ConfigDisabledSuffix = 'desactive'
@@ -19,12 +19,16 @@ $KnownProjectTypesDisplay = $KnownProjectTypes -join ', '
 $FallbackProjectType = 'py'
 $FallbackCreatePythonVenv = $true
 $FallbackPythonInstallLocation = 'depot'
+$FallbackAskInstallGitHubCliWhenMissing = $true
+$FallbackAskInstallPythonManagerWhenMissing = $true
+$FallbackGitHubRepositoryVisibility = 'private'
 $PythonDepotFolderName = 'Python'
 $ConfigPath = Join-Path -Path $PSScriptRoot -ChildPath $ConfigFileName
 $script:OriginalConsoleInputEncoding = $null
 $script:OriginalConsoleOutputEncoding = $null
 $script:OriginalCommandOutputEncoding = $null
 $script:OriginalConsoleCodePage = $null
+$script:OriginalLocation = $null
 
 function Set-Utf8ConsoleEncoding {
     $utf8Encoding = [System.Text.UTF8Encoding]::new($false)
@@ -103,6 +107,27 @@ function Write-StepInfo {
     )
 
     Write-Host $Message -ForegroundColor DarkCyan
+}
+
+function Get-TextWithoutDiacritics {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Text
+    )
+
+    $normalizedText = $Text.Normalize([Text.NormalizationForm]::FormD)
+    $builder = [System.Text.StringBuilder]::new()
+
+    foreach ($character in $normalizedText.ToCharArray()) {
+        $unicodeCategory = [Globalization.CharUnicodeInfo]::GetUnicodeCategory($character)
+        if ($unicodeCategory -eq [Globalization.UnicodeCategory]::NonSpacingMark) {
+            continue
+        }
+
+        [void] $builder.Append($character)
+    }
+
+    return $builder.ToString().Normalize([Text.NormalizationForm]::FormC)
 }
 
 function Get-NormalizedProjectType {
@@ -201,6 +226,47 @@ function Get-NormalizedBooleanSetting {
         '^(0|n|non|no|false|faux)$' { return $false }
         default {
             throw "$SettingName est invalide. Valeurs acceptées : true/false, o/oui ou n/non."
+        }
+    }
+}
+
+function Get-NormalizedGitHubRepositoryVisibilitySetting {
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $Visibility,
+
+        [switch] $AllowDefault,
+
+        [string] $DefaultVisibility = $FallbackGitHubRepositoryVisibility
+    )
+
+    $normalizedDefaultVisibility = if ([string]::IsNullOrWhiteSpace($DefaultVisibility)) {
+        $FallbackGitHubRepositoryVisibility
+    }
+    else {
+        $DefaultVisibility.Trim().ToLowerInvariant()
+    }
+
+    if ($normalizedDefaultVisibility -notin @('private', 'public')) {
+        throw "La visibilité GitHub par défaut '$DefaultVisibility' est invalide."
+    }
+
+    $visibilityText = if ($null -eq $Visibility) { '' } else { $Visibility.Trim() }
+
+    if ([string]::IsNullOrWhiteSpace($visibilityText)) {
+        if ($AllowDefault) {
+            return $normalizedDefaultVisibility
+        }
+
+        throw 'La visibilité GitHub ne peut pas être vide.'
+    }
+
+    switch -Regex ($visibilityText.ToLowerInvariant()) {
+        '^(1|prive|privé|private)$' { return 'private' }
+        '^(2|public|publique)$' { return 'public' }
+        default {
+            throw "La visibilité GitHub '$Visibility' est invalide."
         }
     }
 }
@@ -353,17 +419,19 @@ function Read-ExistingProjectAction {
     )
 
     Write-Host "Le dossier '$ProjectName' existe déjà : $ProjectPath" -ForegroundColor Yellow
-    Write-Host '1. Changer le nom'
-    Write-Host '2. Fermer sans rien faire'
+    Write-Host '1. Mettre à jour le projet existant'
+    Write-Host '2. Changer le nom'
+    Write-Host '3. Fermer sans rien faire'
 
     while ($true) {
-        $answer = (Read-Host 'Choix (1/2)').Trim()
+        $answer = (Read-Host 'Choix (1/2/3)').Trim()
 
         switch -Regex ($answer) {
-            '^(1|c|changer)$' { return 'Rename' }
-            '^(2|f|fermer)$' { return 'Cancel' }
+            '^(1|m|maj|mettre-a-jour|mettre à jour|update)$' { return 'Update' }
+            '^(2|c|changer)$' { return 'Rename' }
+            '^(3|f|fermer)$' { return 'Cancel' }
             default {
-                Write-Host 'Choisissez 1 pour changer le nom ou 2 pour fermer.' -ForegroundColor Yellow
+                Write-Host 'Choisissez 1 pour mettre à jour, 2 pour changer le nom ou 3 pour fermer.' -ForegroundColor Yellow
             }
         }
     }
@@ -418,6 +486,42 @@ function Read-CreatePythonVenv {
     )
 
     return Read-ConfirmationWithDefault -Prompt 'Créer un environnement virtuel Python ".venv" ?' -DefaultValue $DefaultCreatePythonVenv
+}
+
+function Read-GitHubRepositoryVisibilityChoice {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $DefaultGitHubRepositoryVisibility
+    )
+
+    $normalizedDefaultVisibility = Get-NormalizedGitHubRepositoryVisibilitySetting `
+        -Visibility $DefaultGitHubRepositoryVisibility `
+        -AllowDefault `
+        -DefaultVisibility $FallbackGitHubRepositoryVisibility
+    $defaultChoiceLabel = if ($normalizedDefaultVisibility -eq 'private') { '1' } else { '2' }
+
+    Write-Host 'Créer le dépôt GitHub :'
+    Write-Host '1. Privé'
+    Write-Host '2. Public'
+    Write-Host '3. Ne pas créer de dépôt GitHub'
+
+    while ($true) {
+        $answer = (Read-Host "Visibilité du dépôt GitHub (Entrée = $defaultChoiceLabel)").Trim()
+
+        if ($answer -match '^(3|n|non|skip|ignorer)$') {
+            return 'skip'
+        }
+
+        try {
+            return Get-NormalizedGitHubRepositoryVisibilitySetting `
+                -Visibility $answer `
+                -AllowDefault `
+                -DefaultVisibility $normalizedDefaultVisibility
+        }
+        catch {
+            Write-Host "Choisissez 1 pour privé, 2 pour public ou 3 pour ne pas créer de dépôt GitHub. Entrée = $defaultChoiceLabel." -ForegroundColor Yellow
+        }
+    }
 }
 
 function Get-NormalizedPythonInstallLocationSetting {
@@ -1034,6 +1138,139 @@ function Get-NormalizedDefaultPythonInstallLocationFromConfig {
     }
 }
 
+function Get-NormalizedAskInstallGitHubCliWhenMissingFromConfig {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $RawConfig,
+
+        [Parameter(Mandatory = $true)]
+        [string] $ConfigPath,
+
+        [AllowNull()]
+        [System.Collections.Generic.List[string]] $SyncReasons = [System.Collections.Generic.List[string]]::new()
+    )
+
+    if (-not (Test-ConfigPropertyExists -Config $RawConfig -PropertyName 'AskInstallGitHubCliWhenMissing')) {
+        $SyncReasons.Add("Le paramètre AskInstallGitHubCliWhenMissing de '$ConfigPath' a été ajouté avec la valeur '$FallbackAskInstallGitHubCliWhenMissing'.")
+        return $FallbackAskInstallGitHubCliWhenMissing
+    }
+
+    try {
+        $askInstallGitHubCliWhenMissing = Get-NormalizedBooleanSetting `
+            -Value $RawConfig.AskInstallGitHubCliWhenMissing `
+            -SettingName "Le paramètre AskInstallGitHubCliWhenMissing de '$ConfigPath'"
+
+        if (-not ($RawConfig.AskInstallGitHubCliWhenMissing -is [bool])) {
+            $SyncReasons.Add("Le paramètre AskInstallGitHubCliWhenMissing de '$ConfigPath' a été normalisé en '$askInstallGitHubCliWhenMissing'.")
+        }
+
+        return $askInstallGitHubCliWhenMissing
+    }
+    catch {
+        $SyncReasons.Add("Le paramètre AskInstallGitHubCliWhenMissing de '$ConfigPath' est invalide. Il a été remplacé par '$FallbackAskInstallGitHubCliWhenMissing'.")
+        return $FallbackAskInstallGitHubCliWhenMissing
+    }
+}
+
+function Get-NormalizedAskInstallPythonManagerWhenMissingFromConfig {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $RawConfig,
+
+        [Parameter(Mandatory = $true)]
+        [string] $ConfigPath,
+
+        [AllowNull()]
+        [System.Collections.Generic.List[string]] $SyncReasons = [System.Collections.Generic.List[string]]::new()
+    )
+
+    if (-not (Test-ConfigPropertyExists -Config $RawConfig -PropertyName 'AskInstallPythonManagerWhenMissing')) {
+        $SyncReasons.Add("Le paramètre AskInstallPythonManagerWhenMissing de '$ConfigPath' a été ajouté avec la valeur '$FallbackAskInstallPythonManagerWhenMissing'.")
+        return $FallbackAskInstallPythonManagerWhenMissing
+    }
+
+    try {
+        $askInstallPythonManagerWhenMissing = Get-NormalizedBooleanSetting `
+            -Value $RawConfig.AskInstallPythonManagerWhenMissing `
+            -SettingName "Le paramètre AskInstallPythonManagerWhenMissing de '$ConfigPath'"
+
+        if (-not ($RawConfig.AskInstallPythonManagerWhenMissing -is [bool])) {
+            $SyncReasons.Add("Le paramètre AskInstallPythonManagerWhenMissing de '$ConfigPath' a été normalisé en '$askInstallPythonManagerWhenMissing'.")
+        }
+
+        return $askInstallPythonManagerWhenMissing
+    }
+    catch {
+        $SyncReasons.Add("Le paramètre AskInstallPythonManagerWhenMissing de '$ConfigPath' est invalide. Il a été remplacé par '$FallbackAskInstallPythonManagerWhenMissing'.")
+        return $FallbackAskInstallPythonManagerWhenMissing
+    }
+}
+
+function Get-NormalizedDefaultGitHubRepositoryVisibilityFromConfig {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $RawConfig,
+
+        [Parameter(Mandatory = $true)]
+        [string] $ConfigPath,
+
+        [AllowNull()]
+        [System.Collections.Generic.List[string]] $SyncReasons = [System.Collections.Generic.List[string]]::new()
+    )
+
+    if (-not (Test-ConfigPropertyExists -Config $RawConfig -PropertyName 'DefaultGitHubRepositoryVisibility')) {
+        $SyncReasons.Add("Le paramètre DefaultGitHubRepositoryVisibility de '$ConfigPath' a été ajouté avec la valeur '$FallbackGitHubRepositoryVisibility'.")
+        return $FallbackGitHubRepositoryVisibility
+    }
+
+    try {
+        $defaultGitHubRepositoryVisibility = Get-NormalizedGitHubRepositoryVisibilitySetting `
+            -Visibility $RawConfig.DefaultGitHubRepositoryVisibility `
+            -AllowDefault `
+            -DefaultVisibility $FallbackGitHubRepositoryVisibility
+
+        if ("$($RawConfig.DefaultGitHubRepositoryVisibility)".Trim().ToLowerInvariant() -cne $defaultGitHubRepositoryVisibility) {
+            $SyncReasons.Add("Le paramètre DefaultGitHubRepositoryVisibility de '$ConfigPath' a été normalisé en '$defaultGitHubRepositoryVisibility'.")
+        }
+
+        return $defaultGitHubRepositoryVisibility
+    }
+    catch {
+        $SyncReasons.Add("Le paramètre DefaultGitHubRepositoryVisibility de '$ConfigPath' est invalide. Il a été remplacé par '$FallbackGitHubRepositoryVisibility'.")
+        return $FallbackGitHubRepositoryVisibility
+    }
+}
+
+function Get-NormalizedGitHubLoginFromConfig {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $RawConfig,
+
+        [Parameter(Mandatory = $true)]
+        [string] $ConfigPath,
+
+        [AllowNull()]
+        [System.Collections.Generic.List[string]] $SyncReasons = [System.Collections.Generic.List[string]]::new()
+    )
+
+    if (-not (Test-ConfigPropertyExists -Config $RawConfig -PropertyName 'GitHubLogin')) {
+        $SyncReasons.Add("Le paramètre GitHubLogin de '$ConfigPath' a été ajouté.")
+        return $null
+    }
+
+    $gitHubLoginText = "$($RawConfig.GitHubLogin)".Trim()
+    if ([string]::IsNullOrWhiteSpace($gitHubLoginText)) {
+        return $null
+    }
+
+    $normalizedGitHubLogin = $gitHubLoginText.ToLowerInvariant()
+    if ($gitHubLoginText -cne $normalizedGitHubLogin) {
+        $SyncReasons.Add("Le paramètre GitHubLogin de '$ConfigPath' a été normalisé en '$normalizedGitHubLogin'.")
+    }
+
+    return $normalizedGitHubLogin
+}
+
 function New-ProjectConfigData {
     param(
         [Parameter(Mandatory = $true)]
@@ -1047,6 +1284,19 @@ function New-ProjectConfigData {
 
         [Parameter(Mandatory = $true)]
         [string] $DefaultPythonInstallLocation,
+
+        [Parameter(Mandatory = $true)]
+        [bool] $AskInstallGitHubCliWhenMissing,
+
+        [Parameter(Mandatory = $true)]
+        [bool] $AskInstallPythonManagerWhenMissing,
+
+        [Parameter(Mandatory = $true)]
+        [string] $DefaultGitHubRepositoryVisibility,
+
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $GitHubLogin,
 
         [AllowNull()]
         [AllowEmptyString()]
@@ -1063,8 +1313,64 @@ function New-ProjectConfigData {
         DefaultProjectType = $DefaultProjectType
         DefaultCreatePythonVenv = $DefaultCreatePythonVenv
         DefaultPythonInstallLocation = $DefaultPythonInstallLocation
+        AskInstallGitHubCliWhenMissing = $AskInstallGitHubCliWhenMissing
+        AskInstallPythonManagerWhenMissing = $AskInstallPythonManagerWhenMissing
+        DefaultGitHubRepositoryVisibility = $DefaultGitHubRepositoryVisibility
+        GitHubLogin = $GitHubLogin
         PythonDepotPath = $PythonDepotPath
         KnownPythonInterpreters = @(ConvertTo-CanonicalPythonInterpreterEntries -Entries $KnownPythonInterpreters)
+    }
+}
+
+function Add-JsonPropertyWithComments {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.Generic.List[string]] $Lines,
+
+        [Parameter(Mandatory = $true)]
+        [string] $PropertyName,
+
+        [AllowNull()]
+        [string[]] $Comments = @(),
+
+        [AllowNull()]
+        [object] $Value,
+
+        [Parameter(Mandatory = $true)]
+        [bool] $IsLast
+    )
+
+    foreach ($comment in @($Comments)) {
+        if (-not [string]::IsNullOrWhiteSpace("$comment")) {
+            $Lines.Add("  // $comment")
+        }
+    }
+
+    $jsonText = $Value | ConvertTo-Json -Depth 6
+    if ([string]::IsNullOrWhiteSpace("$jsonText")) {
+        $jsonText = '[]'
+    }
+
+    $jsonValueLines = @($jsonText -split "`r?`n")
+    if ($jsonValueLines.Count -le 1) {
+        $propertyLine = "  ""$PropertyName"": $($jsonValueLines[0])"
+        if (-not $IsLast) {
+            $propertyLine += ','
+        }
+
+        $Lines.Add($propertyLine)
+        return
+    }
+
+    $Lines.Add("  ""$PropertyName"": $($jsonValueLines[0])")
+
+    for ($index = 1; $index -lt $jsonValueLines.Count; $index++) {
+        $line = "  $($jsonValueLines[$index])"
+        if ($index -eq ($jsonValueLines.Count - 1) -and -not $IsLast) {
+            $line += ','
+        }
+
+        $Lines.Add($line)
     }
 }
 
@@ -1074,21 +1380,84 @@ function Get-ProjectConfigText {
         [hashtable] $ConfigData
     )
 
-    $commentLines = @(
-        '// Configuration du script prepare-nouveau-projet',
-        "// Types de projet connus : $KnownProjectTypesDisplay",
-        '// Modifiez "DefaultProjectType" pour changer le type utilisé quand vous appuyez seulement sur Entrée.',
-        '// Modifiez "DefaultCreatePythonVenv" : true = O par défaut, false = N par défaut pour les projets Python.',
-        '// Modifiez "DefaultPythonInstallLocation" : "depot" = installer par défaut dans le dépôt venv, "default" = utiliser l''installation par défaut de pymanager.',
-        '// "PythonDepotPath" est le dépôt dédié aux versions Python installées pour créer des venv.',
-        '// Si "PythonDepotPath" est vide, le script vous proposera un dépôt par défaut à côté du dossier projet.',
-        '// "KnownPythonInterpreters" est le catalogue synchronisé des versions Python détectées avec leur source, leur version et leur chemin.',
-        '// "KnownPythonInterpreters" est synchronisé automatiquement depuis "pymanager list --format=exe" ou "py list --format=exe", plus les chemins Python personnalisés que vous avez déjà saisis.',
-        ''
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add('{')
+
+    $propertyDefinitions = @(
+        [PSCustomObject]@{
+            Name = 'ConfigVersion'
+            Comments = @('Version du format de configuration utilisée par le script.')
+            Value = $ConfigData.ConfigVersion
+        },
+        [PSCustomObject]@{
+            Name = 'ScriptVersion'
+            Comments = @('Version du script qui a enregistré cette configuration.')
+            Value = $ConfigData.ScriptVersion
+        },
+        [PSCustomObject]@{
+            Name = 'ProjectsRootPath'
+            Comments = @('Chemin du dossier racine où créer les projets.')
+            Value = $ConfigData.ProjectsRootPath
+        },
+        [PSCustomObject]@{
+            Name = 'DefaultProjectType'
+            Comments = @("Types de projet connus : $KnownProjectTypesDisplay", 'Type utilisé quand vous appuyez seulement sur Entrée.')
+            Value = $ConfigData.DefaultProjectType
+        },
+        [PSCustomObject]@{
+            Name = 'DefaultCreatePythonVenv'
+            Comments = @('true = O par défaut, false = N par défaut pour les projets Python.')
+            Value = $ConfigData.DefaultCreatePythonVenv
+        },
+        [PSCustomObject]@{
+            Name = 'DefaultPythonInstallLocation'
+            Comments = @('"depot" = installer par défaut dans le dépôt venv, "default" = utiliser l''installation par défaut de pymanager.')
+            Value = $ConfigData.DefaultPythonInstallLocation
+        },
+        [PSCustomObject]@{
+            Name = 'AskInstallGitHubCliWhenMissing'
+            Comments = @('true = reposer la question d''installation de gh si gh est absent et winget présent, false = ne plus reposer la question.', 'Remettez cette valeur à true si vous voulez être redemandé plus tard.')
+            Value = $ConfigData.AskInstallGitHubCliWhenMissing
+        },
+        [PSCustomObject]@{
+            Name = 'AskInstallPythonManagerWhenMissing'
+            Comments = @('true = reposer la question d''installation de pymanager si pymanager est absent et winget présent, false = ne plus reposer la question.', 'Remettez cette valeur à true si vous voulez être redemandé plus tard.')
+            Value = $ConfigData.AskInstallPythonManagerWhenMissing
+        },
+        [PSCustomObject]@{
+            Name = 'DefaultGitHubRepositoryVisibility'
+            Comments = @('"private" = dépôt GitHub privé par défaut, "public" = dépôt GitHub public par défaut.')
+            Value = $ConfigData.DefaultGitHubRepositoryVisibility
+        },
+        [PSCustomObject]@{
+            Name = 'GitHubLogin'
+            Comments = @('Login GitHub mémorisé pour détecter un changement de compte gh.')
+            Value = $ConfigData.GitHubLogin
+        },
+        [PSCustomObject]@{
+            Name = 'PythonDepotPath'
+            Comments = @('Dépôt dédié aux versions Python installées pour créer des venv.', 'Laissez vide si vous ne voulez pas de dépôt Python dédié.')
+            Value = $ConfigData.PythonDepotPath
+        },
+        [PSCustomObject]@{
+            Name = 'KnownPythonInterpreters'
+            Comments = @('Catalogue synchronisé des versions Python détectées avec leur source, leur version et leur chemin.', 'Synchronisé automatiquement depuis "pymanager list --format=exe" ou "py list --format=exe", plus les chemins Python personnalisés déjà saisis.')
+            Value = $ConfigData.KnownPythonInterpreters
+        }
     )
 
-    $json = $ConfigData | ConvertTo-Json -Depth 6
-    return (($commentLines -join [Environment]::NewLine) + $json + [Environment]::NewLine)
+    for ($index = 0; $index -lt $propertyDefinitions.Count; $index++) {
+        $propertyDefinition = $propertyDefinitions[$index]
+        Add-JsonPropertyWithComments `
+            -Lines $lines `
+            -PropertyName $propertyDefinition.Name `
+            -Comments $propertyDefinition.Comments `
+            -Value $propertyDefinition.Value `
+            -IsLast ($index -eq ($propertyDefinitions.Count - 1))
+    }
+
+    $lines.Add('}')
+    return (($lines.ToArray() -join [Environment]::NewLine) + [Environment]::NewLine)
 }
 
 function Save-ProjectConfig {
@@ -1108,6 +1477,19 @@ function Save-ProjectConfig {
         [Parameter(Mandatory = $true)]
         [string] $DefaultPythonInstallLocation,
 
+        [Parameter(Mandatory = $true)]
+        [bool] $AskInstallGitHubCliWhenMissing,
+
+        [Parameter(Mandatory = $true)]
+        [bool] $AskInstallPythonManagerWhenMissing,
+
+        [Parameter(Mandatory = $true)]
+        [string] $DefaultGitHubRepositoryVisibility,
+
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $GitHubLogin = $null,
+
         [AllowNull()]
         [AllowEmptyString()]
         [string] $PythonDepotPath = $null,
@@ -1125,6 +1507,22 @@ function Save-ProjectConfig {
         -InstallLocation $DefaultPythonInstallLocation `
         -AllowDefault `
         -DefaultInstallLocation $FallbackPythonInstallLocation
+    $normalizedAskInstallGitHubCliWhenMissing = Get-NormalizedBooleanSetting `
+        -Value $AskInstallGitHubCliWhenMissing `
+        -SettingName 'Le paramètre AskInstallGitHubCliWhenMissing'
+    $normalizedAskInstallPythonManagerWhenMissing = Get-NormalizedBooleanSetting `
+        -Value $AskInstallPythonManagerWhenMissing `
+        -SettingName 'Le paramètre AskInstallPythonManagerWhenMissing'
+    $normalizedDefaultGitHubRepositoryVisibility = Get-NormalizedGitHubRepositoryVisibilitySetting `
+        -Visibility $DefaultGitHubRepositoryVisibility `
+        -AllowDefault `
+        -DefaultVisibility $FallbackGitHubRepositoryVisibility
+    $normalizedGitHubLogin = if ([string]::IsNullOrWhiteSpace("$GitHubLogin")) {
+        $null
+    }
+    else {
+        "$GitHubLogin".Trim().ToLowerInvariant()
+    }
     $normalizedPythonDepotPath = $null
     if (-not [string]::IsNullOrWhiteSpace("$PythonDepotPath")) {
         $normalizedPythonDepotPath = Get-NormalizedPath -Path $PythonDepotPath
@@ -1138,6 +1536,10 @@ function Save-ProjectConfig {
         -DefaultProjectType $normalizedDefaultProjectType `
         -DefaultCreatePythonVenv $normalizedDefaultCreatePythonVenv `
         -DefaultPythonInstallLocation $normalizedDefaultPythonInstallLocation `
+        -AskInstallGitHubCliWhenMissing $normalizedAskInstallGitHubCliWhenMissing `
+        -AskInstallPythonManagerWhenMissing $normalizedAskInstallPythonManagerWhenMissing `
+        -DefaultGitHubRepositoryVisibility $normalizedDefaultGitHubRepositoryVisibility `
+        -GitHubLogin $normalizedGitHubLogin `
         -PythonDepotPath $normalizedPythonDepotPath `
         -KnownPythonInterpreters $normalizedKnownPythonInterpreters
     $configText = Get-ProjectConfigText -ConfigData $config
@@ -1152,6 +1554,10 @@ function Save-ProjectConfig {
         DefaultProjectType = $normalizedDefaultProjectType
         DefaultCreatePythonVenv = $normalizedDefaultCreatePythonVenv
         DefaultPythonInstallLocation = $normalizedDefaultPythonInstallLocation
+        AskInstallGitHubCliWhenMissing = $normalizedAskInstallGitHubCliWhenMissing
+        AskInstallPythonManagerWhenMissing = $normalizedAskInstallPythonManagerWhenMissing
+        DefaultGitHubRepositoryVisibility = $normalizedDefaultGitHubRepositoryVisibility
+        GitHubLogin = $normalizedGitHubLogin
         PythonDepotPath = $normalizedPythonDepotPath
         KnownPythonInterpreters = $normalizedKnownPythonInterpreters
     }
@@ -1259,6 +1665,22 @@ function ConvertTo-NormalizedProjectConfig {
         -RawConfig $RawConfig `
         -ConfigPath $ConfigPath `
         -SyncReasons $syncReasons
+    $askInstallGitHubCliWhenMissing = Get-NormalizedAskInstallGitHubCliWhenMissingFromConfig `
+        -RawConfig $RawConfig `
+        -ConfigPath $ConfigPath `
+        -SyncReasons $syncReasons
+    $askInstallPythonManagerWhenMissing = Get-NormalizedAskInstallPythonManagerWhenMissingFromConfig `
+        -RawConfig $RawConfig `
+        -ConfigPath $ConfigPath `
+        -SyncReasons $syncReasons
+    $defaultGitHubRepositoryVisibility = Get-NormalizedDefaultGitHubRepositoryVisibilityFromConfig `
+        -RawConfig $RawConfig `
+        -ConfigPath $ConfigPath `
+        -SyncReasons $syncReasons
+    $gitHubLogin = Get-NormalizedGitHubLoginFromConfig `
+        -RawConfig $RawConfig `
+        -ConfigPath $ConfigPath `
+        -SyncReasons $syncReasons
     $legacyCustomPythonPaths = Get-LegacyCustomPythonPathsFromConfig -RawConfig $RawConfig -ConfigPath $ConfigPath -SyncReasons $syncReasons
     $knownPythonInterpreters = Get-NormalizedKnownPythonInterpretersFromConfig -RawConfig $RawConfig -ConfigPath $ConfigPath -SyncReasons $syncReasons
     $pythonDepotPath = Get-NormalizedPythonDepotPathFromConfig -RawConfig $RawConfig -ConfigPath $ConfigPath -SyncReasons $syncReasons
@@ -1281,6 +1703,10 @@ function ConvertTo-NormalizedProjectConfig {
         DefaultProjectType = $defaultProjectType
         DefaultCreatePythonVenv = $defaultCreatePythonVenv
         DefaultPythonInstallLocation = $defaultPythonInstallLocation
+        AskInstallGitHubCliWhenMissing = $askInstallGitHubCliWhenMissing
+        AskInstallPythonManagerWhenMissing = $askInstallPythonManagerWhenMissing
+        DefaultGitHubRepositoryVisibility = $defaultGitHubRepositoryVisibility
+        GitHubLogin = $gitHubLogin
         PythonDepotPath = $pythonDepotPath
         KnownPythonInterpreters = $knownPythonInterpreters
         SyncReasons = $syncReasons.ToArray()
@@ -1388,6 +1814,10 @@ function Use-ExistingProjectConfig {
                 -DefaultProjectType $configStatus.Config.DefaultProjectType `
                 -DefaultCreatePythonVenv $configStatus.Config.DefaultCreatePythonVenv `
                 -DefaultPythonInstallLocation $configStatus.Config.DefaultPythonInstallLocation `
+                -AskInstallGitHubCliWhenMissing $configStatus.Config.AskInstallGitHubCliWhenMissing `
+                -AskInstallPythonManagerWhenMissing $configStatus.Config.AskInstallPythonManagerWhenMissing `
+                -DefaultGitHubRepositoryVisibility $configStatus.Config.DefaultGitHubRepositoryVisibility `
+                -GitHubLogin $configStatus.Config.GitHubLogin `
                 -PythonDepotPath $configStatus.Config.PythonDepotPath `
                 -KnownPythonInterpreters $configStatus.Config.KnownPythonInterpreters `
                 -Message $configStatus.Message
@@ -1420,6 +1850,19 @@ function Ensure-ConfigCopy {
         [Parameter(Mandatory = $true)]
         [string] $DefaultPythonInstallLocation,
 
+        [Parameter(Mandatory = $true)]
+        [bool] $AskInstallGitHubCliWhenMissing,
+
+        [Parameter(Mandatory = $true)]
+        [bool] $AskInstallPythonManagerWhenMissing,
+
+        [Parameter(Mandatory = $true)]
+        [string] $DefaultGitHubRepositoryVisibility,
+
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $GitHubLogin,
+
         [AllowNull()]
         [AllowEmptyString()]
         [string] $PythonDepotPath,
@@ -1437,6 +1880,10 @@ function Ensure-ConfigCopy {
         -DefaultProjectType $DefaultProjectType `
         -DefaultCreatePythonVenv $DefaultCreatePythonVenv `
         -DefaultPythonInstallLocation $DefaultPythonInstallLocation `
+        -AskInstallGitHubCliWhenMissing $AskInstallGitHubCliWhenMissing `
+        -AskInstallPythonManagerWhenMissing $AskInstallPythonManagerWhenMissing `
+        -DefaultGitHubRepositoryVisibility $DefaultGitHubRepositoryVisibility `
+        -GitHubLogin $GitHubLogin `
         -PythonDepotPath $PythonDepotPath `
         -KnownPythonInterpreters $KnownPythonInterpreters `
         -Message 'Configuration synchronisée'
@@ -1466,6 +1913,10 @@ function Initialize-ProjectConfig {
             -DefaultProjectType $FallbackProjectType `
             -DefaultCreatePythonVenv $FallbackCreatePythonVenv `
             -DefaultPythonInstallLocation $FallbackPythonInstallLocation `
+            -AskInstallGitHubCliWhenMissing $FallbackAskInstallGitHubCliWhenMissing `
+            -AskInstallPythonManagerWhenMissing $FallbackAskInstallPythonManagerWhenMissing `
+            -DefaultGitHubRepositoryVisibility $FallbackGitHubRepositoryVisibility `
+            -GitHubLogin $null `
             -PythonDepotPath $null
     }
 
@@ -1480,6 +1931,10 @@ function Initialize-ProjectConfig {
             -DefaultProjectType $FallbackProjectType `
             -DefaultCreatePythonVenv $FallbackCreatePythonVenv `
             -DefaultPythonInstallLocation $FallbackPythonInstallLocation `
+            -AskInstallGitHubCliWhenMissing $FallbackAskInstallGitHubCliWhenMissing `
+            -AskInstallPythonManagerWhenMissing $FallbackAskInstallPythonManagerWhenMissing `
+            -DefaultGitHubRepositoryVisibility $FallbackGitHubRepositoryVisibility `
+            -GitHubLogin $null `
             -PythonDepotPath $null `
             -Message 'Nouvelle configuration créée'
     }
@@ -1490,6 +1945,10 @@ function Initialize-ProjectConfig {
             -DefaultProjectType $candidateConfig.DefaultProjectType `
             -DefaultCreatePythonVenv $candidateConfig.DefaultCreatePythonVenv `
             -DefaultPythonInstallLocation $candidateConfig.DefaultPythonInstallLocation `
+            -AskInstallGitHubCliWhenMissing $candidateConfig.AskInstallGitHubCliWhenMissing `
+            -AskInstallPythonManagerWhenMissing $candidateConfig.AskInstallPythonManagerWhenMissing `
+            -DefaultGitHubRepositoryVisibility $candidateConfig.DefaultGitHubRepositoryVisibility `
+            -GitHubLogin $candidateConfig.GitHubLogin `
             -PythonDepotPath $candidateConfig.PythonDepotPath `
             -KnownPythonInterpreters $candidateConfig.KnownPythonInterpreters `
             -DestinationConfigPath $ConfigPath | Out-Null
@@ -1541,9 +2000,1857 @@ function Ensure-PythonDepotPathConfiguration {
         -DefaultProjectType $ProjectConfig.DefaultProjectType `
         -DefaultCreatePythonVenv $ProjectConfig.DefaultCreatePythonVenv `
         -DefaultPythonInstallLocation $ProjectConfig.DefaultPythonInstallLocation `
+        -AskInstallGitHubCliWhenMissing $ProjectConfig.AskInstallGitHubCliWhenMissing `
+        -AskInstallPythonManagerWhenMissing $ProjectConfig.AskInstallPythonManagerWhenMissing `
+        -DefaultGitHubRepositoryVisibility $ProjectConfig.DefaultGitHubRepositoryVisibility `
+        -GitHubLogin $ProjectConfig.GitHubLogin `
         -PythonDepotPath $pythonDepotPath `
         -KnownPythonInterpreters $ProjectConfig.KnownPythonInterpreters `
         -Message 'Dépôt Python dédié aux venv enregistré'
+}
+
+function Install-GitHubCliWithWinget {
+    $command = Get-WingetCommand
+    if ($null -eq $command) {
+        return $null
+    }
+
+    Write-Host "Commande exécutée : $($command.CommandName) install --id GitHub.cli --accept-package-agreements --accept-source-agreements" -ForegroundColor DarkCyan
+    return Invoke-ExternalExecutableCapture `
+        -ExecutablePath $command.CommandPath `
+        -Arguments @('install', '--id', 'GitHub.cli', '--accept-package-agreements', '--accept-source-agreements') `
+        -WaitMessage 'Installation de GitHub CLI en cours'
+}
+
+function Install-PythonManagerWithWinget {
+    $command = Get-WingetCommand
+    if ($null -eq $command) {
+        return $null
+    }
+
+    Write-Host "Commande exécutée : $($command.CommandName) install 9NQ7512CXL7T -e --accept-package-agreements --disable-interactivity" -ForegroundColor DarkCyan
+    return Invoke-ExternalExecutableCapture `
+        -ExecutablePath $command.CommandPath `
+        -Arguments @('install', '9NQ7512CXL7T', '-e', '--accept-package-agreements', '--disable-interactivity') `
+        -WaitMessage 'Installation de Python Install Manager en cours'
+}
+
+function Ensure-PythonManagerAvailability {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ConfigPath,
+
+        [Parameter(Mandatory = $true)]
+        [object] $ProjectConfig
+    )
+
+    $pymanagerCommand = Get-PymanagerCommand
+    $preferredPythonManagerCommand = Get-PreferredPythonManagerCommand
+    if ($null -ne $pymanagerCommand) {
+        return [PSCustomObject]@{
+            ProjectConfig = $ProjectConfig
+            PythonManagerCommand = $preferredPythonManagerCommand
+        }
+    }
+
+    $wingetCommand = Get-WingetCommand
+    if ($null -eq $wingetCommand) {
+        return [PSCustomObject]@{
+            ProjectConfig = $ProjectConfig
+            PythonManagerCommand = $preferredPythonManagerCommand
+        }
+    }
+
+    if (-not $ProjectConfig.AskInstallPythonManagerWhenMissing) {
+        return [PSCustomObject]@{
+            ProjectConfig = $ProjectConfig
+            PythonManagerCommand = $preferredPythonManagerCommand
+        }
+    }
+
+    $installPythonManager = Read-ConfirmationWithDefault `
+        -Prompt 'Python Install Manager "pymanager" est absent. Voulez-vous l''installer maintenant avec winget ?' `
+        -DefaultValue $true
+
+    if (-not $installPythonManager) {
+        $updatedConfig = Save-ProjectConfig `
+            -ConfigPath $ConfigPath `
+            -ProjectsRootPath $ProjectConfig.ProjectsRootPath `
+            -DefaultProjectType $ProjectConfig.DefaultProjectType `
+            -DefaultCreatePythonVenv $ProjectConfig.DefaultCreatePythonVenv `
+            -DefaultPythonInstallLocation $ProjectConfig.DefaultPythonInstallLocation `
+            -AskInstallGitHubCliWhenMissing $ProjectConfig.AskInstallGitHubCliWhenMissing `
+            -AskInstallPythonManagerWhenMissing $false `
+            -DefaultGitHubRepositoryVisibility $ProjectConfig.DefaultGitHubRepositoryVisibility `
+            -GitHubLogin $ProjectConfig.GitHubLogin `
+            -PythonDepotPath $ProjectConfig.PythonDepotPath `
+            -KnownPythonInterpreters $ProjectConfig.KnownPythonInterpreters `
+            -Message 'Configuration Python Manager enregistrée'
+        Write-Host 'La question d''installation de pymanager ne sera plus reposée tant que AskInstallPythonManagerWhenMissing reste à false dans la configuration.' -ForegroundColor Yellow
+
+        return [PSCustomObject]@{
+            ProjectConfig = $updatedConfig
+            PythonManagerCommand = $preferredPythonManagerCommand
+        }
+    }
+
+    $installResult = Install-PythonManagerWithWinget
+    if ($null -eq $installResult) {
+        return [PSCustomObject]@{
+            ProjectConfig = $ProjectConfig
+            PythonManagerCommand = $preferredPythonManagerCommand
+        }
+    }
+
+    foreach ($outputLine in $installResult.OutputLines) {
+        if (-not [string]::IsNullOrWhiteSpace("$outputLine")) {
+            Write-Host $outputLine
+        }
+    }
+
+    if (-not $installResult.Success) {
+        if (-not [string]::IsNullOrWhiteSpace($installResult.ErrorMessage)) {
+            Write-Host "Impossible d'installer Python Install Manager automatiquement : $($installResult.ErrorMessage)" -ForegroundColor Yellow
+        }
+        else {
+            Write-Host 'Impossible d''installer Python Install Manager automatiquement.' -ForegroundColor Yellow
+        }
+
+        return [PSCustomObject]@{
+            ProjectConfig = $ProjectConfig
+            PythonManagerCommand = $preferredPythonManagerCommand
+        }
+    }
+
+    $preferredPythonManagerCommand = Get-PreferredPythonManagerCommand
+    if ($null -eq (Get-PymanagerCommand)) {
+        Write-Host 'Python Install Manager semble installé, mais la commande "pymanager" n''est pas encore disponible dans cette session. Relancez le script pour l''utiliser.' -ForegroundColor Yellow
+    }
+
+    return [PSCustomObject]@{
+        ProjectConfig = $ProjectConfig
+        PythonManagerCommand = $preferredPythonManagerCommand
+    }
+}
+
+function Ensure-GitHubCliAvailability {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ConfigPath,
+
+        [Parameter(Mandatory = $true)]
+        [object] $ProjectConfig
+    )
+
+    $gitHubCliCommand = Get-GitHubCliCommand
+    if ($null -ne $gitHubCliCommand) {
+        return [PSCustomObject]@{
+            ProjectConfig = $ProjectConfig
+            GitHubCliCommand = $gitHubCliCommand
+        }
+    }
+
+    $wingetCommand = Get-WingetCommand
+    if ($null -eq $wingetCommand) {
+        return [PSCustomObject]@{
+            ProjectConfig = $ProjectConfig
+            GitHubCliCommand = $null
+        }
+    }
+
+    if (-not $ProjectConfig.AskInstallGitHubCliWhenMissing) {
+        return [PSCustomObject]@{
+            ProjectConfig = $ProjectConfig
+            GitHubCliCommand = $null
+        }
+    }
+
+    $installGitHubCli = Read-ConfirmationWithDefault `
+        -Prompt 'GitHub CLI "gh" est absent. Voulez-vous l''installer maintenant avec winget ?' `
+        -DefaultValue $true
+
+    if (-not $installGitHubCli) {
+        $updatedConfig = Save-ProjectConfig `
+            -ConfigPath $ConfigPath `
+            -ProjectsRootPath $ProjectConfig.ProjectsRootPath `
+            -DefaultProjectType $ProjectConfig.DefaultProjectType `
+            -DefaultCreatePythonVenv $ProjectConfig.DefaultCreatePythonVenv `
+            -DefaultPythonInstallLocation $ProjectConfig.DefaultPythonInstallLocation `
+            -AskInstallGitHubCliWhenMissing $false `
+            -AskInstallPythonManagerWhenMissing $ProjectConfig.AskInstallPythonManagerWhenMissing `
+            -DefaultGitHubRepositoryVisibility $ProjectConfig.DefaultGitHubRepositoryVisibility `
+            -GitHubLogin $ProjectConfig.GitHubLogin `
+            -PythonDepotPath $ProjectConfig.PythonDepotPath `
+            -KnownPythonInterpreters $ProjectConfig.KnownPythonInterpreters `
+            -Message 'Configuration GitHub CLI enregistrée'
+        Write-Host 'La question d''installation de gh ne sera plus reposée tant que AskInstallGitHubCliWhenMissing reste à false dans la configuration.' -ForegroundColor Yellow
+
+        return [PSCustomObject]@{
+            ProjectConfig = $updatedConfig
+            GitHubCliCommand = $null
+        }
+    }
+
+    $installResult = Install-GitHubCliWithWinget
+    if ($null -eq $installResult) {
+        return [PSCustomObject]@{
+            ProjectConfig = $ProjectConfig
+            GitHubCliCommand = $null
+        }
+    }
+
+    foreach ($outputLine in $installResult.OutputLines) {
+        if (-not [string]::IsNullOrWhiteSpace("$outputLine")) {
+            Write-Host $outputLine
+        }
+    }
+
+    if (-not $installResult.Success) {
+        if (-not [string]::IsNullOrWhiteSpace($installResult.ErrorMessage)) {
+            Write-Host "Impossible d'installer GitHub CLI automatiquement : $($installResult.ErrorMessage)" -ForegroundColor Yellow
+        }
+        else {
+            Write-Host 'Impossible d''installer GitHub CLI automatiquement.' -ForegroundColor Yellow
+        }
+
+        return [PSCustomObject]@{
+            ProjectConfig = $ProjectConfig
+            GitHubCliCommand = $null
+        }
+    }
+
+    $gitHubCliCommand = Get-GitHubCliCommand
+    if ($null -eq $gitHubCliCommand) {
+        Write-Host 'GitHub CLI semble installé, mais la commande "gh" n''est pas encore disponible dans cette session. Relancez le script pour l''utiliser.' -ForegroundColor Yellow
+    }
+
+    return [PSCustomObject]@{
+        ProjectConfig = $ProjectConfig
+        GitHubCliCommand = $gitHubCliCommand
+    }
+}
+
+function Test-GitRepositoryHasOriginRemote {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath
+    )
+
+    $result = Invoke-GitCommandCapture -Arguments @('-C', $ProjectPath, 'remote', 'get-url', 'origin')
+    return ($null -ne $result -and $result.Success)
+}
+
+function Test-GitHubCliAuthentication {
+    $result = Invoke-GitHubCliCommandCapture -Arguments @('auth', 'status')
+
+    if ($null -eq $result) {
+        return $false
+    }
+
+    return $result.Success
+}
+
+function Ensure-GitHubCliAuthentication {
+    if (Test-GitHubCliAuthentication) {
+        return $true
+    }
+
+    Write-Host 'GitHub CLI est installé mais pas encore connecté à votre compte GitHub.' -ForegroundColor Yellow
+    $loginSucceeded = Invoke-GitHubCliCommandPassthrough `
+        -Arguments @('auth', 'login') `
+        -StartMessage 'Lancement de la connexion GitHub CLI...'
+
+    if (-not $loginSucceeded) {
+        Write-Host 'La connexion GitHub CLI n''a pas été terminée.' -ForegroundColor Yellow
+    }
+
+    if (Test-GitHubCliAuthentication) {
+        Write-Host 'Connexion GitHub CLI détectée.' -ForegroundColor Green
+        return $true
+    }
+
+    Write-Host 'Impossible de confirmer la connexion GitHub CLI dans cette session.' -ForegroundColor Yellow
+    Write-Host 'Vous pouvez relancer plus tard : gh auth login' -ForegroundColor Cyan
+    return $false
+}
+
+function Sync-GitHubLoginConfiguration {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ConfigPath,
+
+        [Parameter(Mandatory = $true)]
+        [object] $ProjectConfig
+    )
+
+    if ($null -eq (Get-GitHubCliCommand)) {
+        return $ProjectConfig
+    }
+
+    if (-not (Test-GitHubCliAuthentication)) {
+        return $ProjectConfig
+    }
+
+    $currentGitHubLogin = (Get-GitHubAuthenticatedLogin).ToLowerInvariant()
+    $storedGitHubLogin = if ([string]::IsNullOrWhiteSpace("$($ProjectConfig.GitHubLogin)")) {
+        ''
+    }
+    else {
+        "$($ProjectConfig.GitHubLogin)".Trim().ToLowerInvariant()
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($storedGitHubLogin) -and $storedGitHubLogin -cne $currentGitHubLogin) {
+        $shouldRelogin = Read-ConfirmationWithDefault `
+            -Prompt "Le login GitHub enregistré est '$storedGitHubLogin' mais gh est connecté avec '$currentGitHubLogin'. Voulez-vous vous déconnecter de gh puis vous reconnecter ?" `
+            -DefaultValue $true
+
+        if ($shouldRelogin) {
+            $logoutSucceeded = Invoke-GitHubCliCommandPassthrough `
+                -Arguments @('auth', 'logout', '--hostname', 'github.com') `
+                -StartMessage 'Déconnexion de GitHub CLI...'
+
+            if (-not $logoutSucceeded) {
+                Write-Host 'La déconnexion GitHub CLI n''a pas été terminée.' -ForegroundColor Yellow
+            }
+
+            if (Ensure-GitHubCliAuthentication) {
+                $currentGitHubLogin = (Get-GitHubAuthenticatedLogin).ToLowerInvariant()
+            }
+        }
+    }
+
+    if ($storedGitHubLogin -ceq $currentGitHubLogin) {
+        return $ProjectConfig
+    }
+
+    return Save-ProjectConfig `
+        -ConfigPath $ConfigPath `
+        -ProjectsRootPath $ProjectConfig.ProjectsRootPath `
+        -DefaultProjectType $ProjectConfig.DefaultProjectType `
+        -DefaultCreatePythonVenv $ProjectConfig.DefaultCreatePythonVenv `
+        -DefaultPythonInstallLocation $ProjectConfig.DefaultPythonInstallLocation `
+        -AskInstallGitHubCliWhenMissing $ProjectConfig.AskInstallGitHubCliWhenMissing `
+        -AskInstallPythonManagerWhenMissing $ProjectConfig.AskInstallPythonManagerWhenMissing `
+        -DefaultGitHubRepositoryVisibility $ProjectConfig.DefaultGitHubRepositoryVisibility `
+        -GitHubLogin $currentGitHubLogin `
+        -PythonDepotPath $ProjectConfig.PythonDepotPath `
+        -KnownPythonInterpreters $ProjectConfig.KnownPythonInterpreters `
+        -Message 'Compte GitHub enregistré'
+}
+
+function Get-GitHubAuthenticatedLogin {
+    $result = Invoke-GitHubCliCommandCapture -Arguments @('api', 'user')
+
+    if ($null -eq $result -or -not $result.Success) {
+        throw "Impossible de déterminer le compte GitHub connecté."
+    }
+
+    $jsonText = ($result.OutputLines -join [Environment]::NewLine).Trim()
+    if ([string]::IsNullOrWhiteSpace($jsonText)) {
+        throw "Impossible de déterminer le compte GitHub connecté."
+    }
+
+    $user = $jsonText | ConvertFrom-Json -ErrorAction Stop
+    $login = "$($user.login)".Trim()
+
+    if ([string]::IsNullOrWhiteSpace($login)) {
+        throw "Impossible de déterminer le compte GitHub connecté."
+    }
+
+    return $login
+}
+
+function Get-GitHubRepositoryInfoForProjectName {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectName
+    )
+
+    $repositoryName = Get-NormalizedGitHubRepositoryName -ProjectName $ProjectName
+    $ownerLogin = Get-GitHubAuthenticatedLogin
+    $repositoryFullName = "$ownerLogin/$repositoryName"
+    $result = Invoke-GitHubCliCommandCapture -Arguments @('repo', 'view', $repositoryFullName, '--json', 'name,url,nameWithOwner')
+
+    if ($null -eq $result) {
+        throw "GitHub CLI 'gh' est introuvable."
+    }
+
+    if ($result.Success) {
+        $jsonText = ($result.OutputLines -join [Environment]::NewLine).Trim()
+        $repositoryData = $jsonText | ConvertFrom-Json -ErrorAction Stop
+
+        return [PSCustomObject]@{
+            Exists = $true
+            RepositoryName = $repositoryName
+            RepositoryFullName = "$($repositoryData.nameWithOwner)".Trim()
+            RepositoryUrl = "$($repositoryData.url)".Trim()
+        }
+    }
+
+    $combinedOutput = ((@($result.OutputLines) + @($result.ErrorMessage)) -join ' ')
+    if ($combinedOutput -match '(?i)(could not resolve to a repository|not found|404)') {
+        return [PSCustomObject]@{
+            Exists = $false
+            RepositoryName = $repositoryName
+            RepositoryFullName = $repositoryFullName
+            RepositoryUrl = ''
+        }
+    }
+
+    throw "Impossible de vérifier le dépôt GitHub '$repositoryFullName'."
+}
+
+function Read-ExistingGitHubRepositoryAction {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $RepositoryFullName,
+
+        [Parameter(Mandatory = $true)]
+        [string] $RepositoryUrl
+    )
+
+    Write-Host "Le dépôt GitHub '$RepositoryFullName' existe déjà : $RepositoryUrl" -ForegroundColor Yellow
+    Write-Host '1. Importer le dépôt GitHub existant'
+    Write-Host '2. Changer le nom du projet'
+    Write-Host '3. Arrêter sans rien créer'
+
+    while ($true) {
+        $answer = (Read-Host 'Choix (1/2/3)').Trim()
+
+        switch -Regex ($answer) {
+            '^(1|i|import|importer)$' { return 'Import' }
+            '^(2|c|changer)$' { return 'Rename' }
+            '^(3|a|arreter|arrêter|stop)$' { return 'Cancel' }
+            default {
+                Write-Host 'Choisissez 1 pour importer, 2 pour changer le nom ou 3 pour arrêter.' -ForegroundColor Yellow
+            }
+        }
+    }
+}
+
+function Remove-ProjectDirectoryIfExists {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath
+    )
+
+    if (-not (Test-Path -LiteralPath $ProjectPath)) {
+        return
+    }
+
+    $item = Get-Item -LiteralPath $ProjectPath -ErrorAction Stop
+    if (-not $item.PSIsContainer) {
+        return
+    }
+
+    Remove-Item -LiteralPath $ProjectPath -Recurse -Force
+    Write-Host "Dossier supprimé : $ProjectPath" -ForegroundColor Yellow
+}
+
+function Import-GitHubRepositoryToProjectPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $RepositoryFullName,
+
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath
+    )
+
+    $gitHubCliCommand = Get-GitHubCliCommand
+    if ($null -eq $gitHubCliCommand) {
+        throw "GitHub CLI 'gh' est introuvable."
+    }
+
+    Write-Host "Commande exécutée : $($gitHubCliCommand.CommandName) repo clone $RepositoryFullName $ProjectPath" -ForegroundColor DarkCyan
+    $result = Invoke-GitHubCliCommandCapture `
+        -Arguments @('repo', 'clone', $RepositoryFullName, $ProjectPath) `
+        -WaitMessage 'Import du dépôt GitHub en cours'
+
+    if ($null -eq $result) {
+        throw "GitHub CLI 'gh' est introuvable."
+    }
+
+    foreach ($outputLine in $result.OutputLines) {
+        if (-not [string]::IsNullOrWhiteSpace("$outputLine")) {
+            Write-Host $outputLine
+        }
+    }
+
+    if (-not $result.Success) {
+        Remove-ProjectDirectoryIfExists -ProjectPath $ProjectPath
+
+        if (-not [string]::IsNullOrWhiteSpace($result.ErrorMessage)) {
+            throw "Impossible d'importer le dépôt GitHub '$RepositoryFullName' : $($result.ErrorMessage)"
+        }
+
+        throw "Impossible d'importer le dépôt GitHub '$RepositoryFullName'."
+    }
+
+    Write-Host "Dépôt GitHub importé : $ProjectPath" -ForegroundColor Green
+}
+
+function Test-TextFileContentMatches {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Path,
+
+        [Parameter(Mandatory = $true)]
+        [string] $ExpectedContent
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $false
+    }
+
+    $currentContent = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
+    return $currentContent -eq $ExpectedContent
+}
+
+function Get-PythonProjectDatedRequirementsFiles {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath
+    )
+
+    return @(Get-ChildItem -LiteralPath $ProjectPath -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^\d{4}-\d{2}-\d{2}requirements\.txt$' })
+}
+
+function Get-PythonProjectReadmeSupplementContent {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectName,
+
+        [bool] $HasVirtualEnvironment = $false
+    )
+
+    $quickStartLines = [System.Collections.Generic.List[string]]::new()
+    if ($HasVirtualEnvironment) {
+        $quickStartLines.Add('.\.venv\Scripts\Activate.ps1')
+        $quickStartLines.Add('python --version')
+    }
+    else {
+        $quickStartLines.Add('python -m venv .venv')
+        $quickStartLines.Add('.\.venv\Scripts\Activate.ps1')
+        $quickStartLines.Add('python --version')
+    }
+
+    $contentLines = @(
+        '',
+        '## Préparation locale',
+        '',
+        'Informations ajoutées par `prepare-nouveau-projet.ps1`.',
+        '',
+        '```',
+        ($quickStartLines -join [Environment]::NewLine),
+        '```',
+        '',
+        '- Le venv local est prévu dans le dossier `.venv`.'
+    )
+
+    return (($contentLines -join [Environment]::NewLine) + [Environment]::NewLine)
+}
+
+function Get-MissingPythonProjectReadmeMarkers {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Content,
+
+        [bool] $HasVirtualEnvironment = $false
+    )
+
+    $expectedMarkers = [System.Collections.Generic.List[string]]::new()
+    $expectedMarkers.Add('Informations ajoutées par `prepare-nouveau-projet.ps1`.')
+    $expectedMarkers.Add('## Préparation locale')
+    $expectedMarkers.Add('.\.venv\Scripts\Activate.ps1')
+    $expectedMarkers.Add('- Le venv local est prévu dans le dossier `.venv`.')
+
+    if (-not $HasVirtualEnvironment) {
+        $expectedMarkers.Add('python -m venv .venv')
+    }
+
+    return @($expectedMarkers | Where-Object { $Content -notmatch [regex]::Escape($_) })
+}
+
+function Ensure-TomlSectionContainsLines {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Content,
+
+        [Parameter(Mandatory = $true)]
+        [string] $SectionHeader,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [string[]] $RequiredLines
+    )
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+    foreach ($line in @(($Content -replace "`r`n", "`n") -split "`n")) {
+        $lines.Add($line)
+    }
+
+    while ($lines.Count -gt 0 -and [string]::IsNullOrWhiteSpace($lines[$lines.Count - 1])) {
+        $lines.RemoveAt($lines.Count - 1)
+    }
+
+    $sectionIndex = -1
+    for ($index = 0; $index -lt $lines.Count; $index++) {
+        if ($lines[$index].Trim() -eq $SectionHeader) {
+            $sectionIndex = $index
+            break
+        }
+    }
+
+    $missingLines = [System.Collections.Generic.List[string]]::new()
+
+    if ($sectionIndex -ge 0) {
+        $sectionEndIndex = $lines.Count
+        for ($index = $sectionIndex + 1; $index -lt $lines.Count; $index++) {
+            if ($lines[$index].Trim().StartsWith('[')) {
+                $sectionEndIndex = $index
+                break
+            }
+        }
+
+        $sectionLines = @()
+        if ($sectionEndIndex -gt ($sectionIndex + 1)) {
+            $sectionLines = @($lines[($sectionIndex + 1)..($sectionEndIndex - 1)])
+        }
+
+        foreach ($requiredLine in @($RequiredLines)) {
+            if ($sectionLines -notcontains $requiredLine) {
+                $missingLines.Add($requiredLine)
+            }
+        }
+
+        if ($missingLines.Count -gt 0) {
+            $insertIndex = $sectionEndIndex
+            foreach ($missingLine in @($missingLines)) {
+                $lines.Insert($insertIndex, $missingLine)
+                $insertIndex++
+            }
+        }
+    }
+    else {
+        foreach ($requiredLine in @($RequiredLines)) {
+            $missingLines.Add($requiredLine)
+        }
+
+        if ($missingLines.Count -gt 0) {
+            if ($lines.Count -gt 0) {
+                $lines.Add('')
+            }
+
+            $lines.Add($SectionHeader)
+            foreach ($missingLine in @($missingLines)) {
+                $lines.Add($missingLine)
+            }
+        }
+    }
+
+    return [PSCustomObject]@{
+        Content = (($lines.ToArray()) -join [Environment]::NewLine) + [Environment]::NewLine
+        MissingLines = @($missingLines)
+    }
+}
+
+function Get-PythonProjectPyprojectUpdateResult {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Content,
+
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $RecommendedPythonVersionRequest = $null
+    )
+
+    $updatedProjectContent = $Content
+    $projectRequiredLines = [System.Collections.Generic.List[string]]::new()
+    $projectChangedEntries = [System.Collections.Generic.List[string]]::new()
+
+    if ($updatedProjectContent -notmatch '(?m)^\s*readme\s*=\s*["'']README\.md["'']\s*$') {
+        $projectRequiredLines.Add('readme = "README.md"')
+        $projectChangedEntries.Add('readme = "README.md"')
+    }
+
+    $requiresPythonConstraint = Get-PythonRequiresVersionConstraint -RecommendedVersionRequest $RecommendedPythonVersionRequest
+    if (-not [string]::IsNullOrWhiteSpace("$requiresPythonConstraint")) {
+        $expectedRequiresPythonLine = "requires-python = ""$requiresPythonConstraint"""
+        $requiresPythonMatch = [System.Text.RegularExpressions.Regex]::Match($updatedProjectContent, '(?m)^\s*requires-python\s*=\s*["'']([^"'']+)["'']\s*$')
+        if (-not $requiresPythonMatch.Success) {
+            $projectRequiredLines.Add($expectedRequiresPythonLine)
+            $projectChangedEntries.Add($expectedRequiresPythonLine)
+        }
+        elseif ($requiresPythonMatch.Groups[1].Value.Trim() -ne $requiresPythonConstraint) {
+            $updatedProjectContent = [System.Text.RegularExpressions.Regex]::Replace(
+                $updatedProjectContent,
+                '(?m)^\s*requires-python\s*=\s*["''][^"'']+["'']\s*$',
+                [System.Text.RegularExpressions.MatchEvaluator]{
+                    param($match)
+                    return $expectedRequiresPythonLine
+                },
+                1
+            )
+            $projectChangedEntries.Add($expectedRequiresPythonLine)
+        }
+    }
+
+    $projectResult = Ensure-TomlSectionContainsLines `
+        -Content $updatedProjectContent `
+        -SectionHeader '[project]' `
+        -RequiredLines $projectRequiredLines.ToArray()
+
+    $buildSystemResult = Ensure-TomlSectionContainsLines `
+        -Content $projectResult.Content `
+        -SectionHeader '[build-system]' `
+        -RequiredLines @(
+            @(
+                if ($Content -notmatch '(?m)^\s*requires\s*=\s*\[[^\]]*setuptools>=61\.0[^\]]*\]\s*$') { 'requires = ["setuptools>=61.0"]' }
+                if ($Content -notmatch '(?m)^\s*build-backend\s*=\s*["'']setuptools\.build_meta["'']\s*$') { 'build-backend = "setuptools.build_meta"' }
+            ) | Where-Object { $_ -ne $null }
+        )
+
+    return [PSCustomObject]@{
+        Content = $buildSystemResult.Content
+        MissingProjectLines = @($projectChangedEntries + $projectResult.MissingLines | Select-Object -Unique)
+        MissingBuildSystemLines = @($buildSystemResult.MissingLines)
+        HasChanges = (
+            $buildSystemResult.Content -ne $Content -or
+            @($projectChangedEntries).Count -gt 0 -or
+            @($projectResult.MissingLines).Count -gt 0 -or
+            @($buildSystemResult.MissingLines).Count -gt 0
+        )
+    }
+}
+
+function Get-PythonRequirementsHeaderUpdateResult {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string] $Content
+    )
+
+    $headerContent = Get-PythonProjectRequirementsContent
+    $requiredLines = @(
+        '# Dépendances Python du projet',
+        '# Ajoutez une dépendance par ligne, par exemple :',
+        '# requests==2.32.3'
+    )
+
+    $missingLines = @($requiredLines | Where-Object { $Content -notmatch [regex]::Escape($_) })
+    if ($missingLines.Count -eq 0) {
+        return [PSCustomObject]@{
+            Content = $Content
+            MissingLines = @()
+            HasChanges = $false
+        }
+    }
+
+    $normalizedContent = $Content
+    if (-not $normalizedContent.EndsWith([Environment]::NewLine) -and -not [string]::IsNullOrEmpty($normalizedContent)) {
+        $normalizedContent += [Environment]::NewLine
+    }
+
+    return [PSCustomObject]@{
+        Content = $headerContent + $normalizedContent
+        MissingLines = $missingLines
+        HasChanges = $true
+    }
+}
+
+function Get-MissingGitIgnoreEntries {
+    param(
+        [AllowNull()]
+        [string[]] $CurrentLines = @(),
+
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectType
+    )
+
+    $missingSections = [System.Collections.Generic.List[object]]::new()
+    $sections = @(Get-ProjectGitIgnoreSections -ProjectType $ProjectType)
+
+    foreach ($section in $sections) {
+        $missingLines = @($section.Lines | Where-Object { $CurrentLines -notcontains $_ })
+        if ($missingLines.Count -gt 0) {
+            $missingSections.Add([PSCustomObject]@{
+                    Title = $section.Title
+                    Lines = $missingLines
+                })
+        }
+    }
+
+    return @($missingSections)
+}
+
+function Update-ProjectGitIgnoreFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath,
+
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectType
+    )
+
+    $gitIgnorePath = Join-Path -Path $ProjectPath -ChildPath '.gitignore'
+    if (-not (Test-Path -LiteralPath $gitIgnorePath)) {
+        return New-ProjectGitIgnoreFile -ProjectPath $ProjectPath -ProjectType $ProjectType
+    }
+
+    $currentContent = [System.IO.File]::ReadAllText($gitIgnorePath, [System.Text.Encoding]::UTF8)
+    $normalizedCurrentContent = $currentContent -replace "`r`n", "`n"
+    $currentLines = @($normalizedCurrentContent -split "`n")
+    $missingSections = @(Get-MissingGitIgnoreEntries -CurrentLines $currentLines -ProjectType $ProjectType)
+
+    if ($missingSections.Count -eq 0) {
+        Write-Host ".gitignore déjà à jour : $gitIgnorePath" -ForegroundColor Yellow
+        return $gitIgnorePath
+    }
+
+    $updatedLines = [System.Collections.Generic.List[string]]::new()
+    foreach ($line in @($currentLines)) {
+        $updatedLines.Add($line)
+    }
+
+    while ($updatedLines.Count -gt 0 -and [string]::IsNullOrWhiteSpace($updatedLines[$updatedLines.Count - 1])) {
+        $updatedLines.RemoveAt($updatedLines.Count - 1)
+    }
+
+    foreach ($section in $missingSections) {
+        if ($updatedLines.Count -gt 0) {
+            $updatedLines.Add('')
+        }
+
+        $updatedLines.Add($section.Title)
+        foreach ($line in @($section.Lines)) {
+            $updatedLines.Add($line)
+        }
+    }
+
+    $updatedContent = (($updatedLines.ToArray()) -join [Environment]::NewLine) + [Environment]::NewLine
+    Write-Utf8TextFile -Path $gitIgnorePath -Content $updatedContent
+    Write-Host ".gitignore mis à jour : $gitIgnorePath" -ForegroundColor Green
+    return $gitIgnorePath
+}
+
+function Get-ImportedPythonProjectSetupPlan {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath,
+
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectName,
+
+        [bool] $WillCreateVirtualEnvironment = $false,
+
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $RecommendedPythonVersionRequest = $null
+    )
+
+    $finalHasVirtualEnvironment = $WillCreateVirtualEnvironment -or (Test-Path -LiteralPath (Join-Path -Path $ProjectPath -ChildPath '.venv'))
+    $changes = [System.Collections.Generic.List[object]]::new()
+
+    $readmePath = Join-Path -Path $ProjectPath -ChildPath 'README.md'
+    if (-not (Test-Path -LiteralPath $readmePath)) {
+        $changes.Add([PSCustomObject]@{
+                Type = 'WriteFile'
+                Path = $readmePath
+                Description = 'Créer README.md'
+                Content = (Get-PythonProjectReadmeContent -ProjectName $ProjectName -HasVirtualEnvironment $finalHasVirtualEnvironment)
+                WithoutBom = $false
+            })
+    }
+    else {
+        $readmeContent = [System.IO.File]::ReadAllText($readmePath, [System.Text.Encoding]::UTF8)
+        $missingReadmeMarkers = @(Get-MissingPythonProjectReadmeMarkers -Content $readmeContent -HasVirtualEnvironment $finalHasVirtualEnvironment)
+        if ($missingReadmeMarkers.Count -gt 0) {
+            $changes.Add([PSCustomObject]@{
+                    Type = 'WriteFile'
+                    Path = $readmePath
+                    Description = 'Compléter README.md'
+                    Content = ($readmeContent.TrimEnd("`r", "`n") + (Get-PythonProjectReadmeSupplementContent -ProjectName $ProjectName -HasVirtualEnvironment $finalHasVirtualEnvironment))
+                    WithoutBom = $false
+                    MissingEntries = $missingReadmeMarkers
+                })
+        }
+    }
+
+    $pyprojectPath = Join-Path -Path $ProjectPath -ChildPath 'pyproject.toml'
+    if (-not (Test-Path -LiteralPath $pyprojectPath)) {
+        $changes.Add([PSCustomObject]@{
+                Type = 'WriteFile'
+                Path = $pyprojectPath
+                Description = 'Créer pyproject.toml'
+                Content = (Get-PythonProjectPyprojectContent -ProjectName $ProjectName -RecommendedPythonVersionRequest $RecommendedPythonVersionRequest)
+                WithoutBom = $false
+            })
+    }
+    else {
+        $pyprojectContent = [System.IO.File]::ReadAllText($pyprojectPath, [System.Text.Encoding]::UTF8)
+        $pyprojectUpdateResult = Get-PythonProjectPyprojectUpdateResult `
+            -Content $pyprojectContent `
+            -RecommendedPythonVersionRequest $RecommendedPythonVersionRequest
+        if ($pyprojectUpdateResult.HasChanges) {
+            $changes.Add([PSCustomObject]@{
+                    Type = 'WriteFile'
+                    Path = $pyprojectPath
+                    Description = 'Compléter pyproject.toml'
+                    Content = $pyprojectUpdateResult.Content
+                    WithoutBom = $false
+                    MissingEntries = @($pyprojectUpdateResult.MissingProjectLines + $pyprojectUpdateResult.MissingBuildSystemLines)
+                })
+        }
+    }
+
+    $datedRequirementsFiles = @(Get-PythonProjectDatedRequirementsFiles -ProjectPath $ProjectPath)
+    if ($datedRequirementsFiles.Count -eq 0) {
+        $requirementsPath = Join-Path -Path $ProjectPath -ChildPath (Get-PythonRequirementsFileName)
+        $changes.Add([PSCustomObject]@{
+                Type = 'WriteFile'
+                Path = $requirementsPath
+                Description = "Créer $(Split-Path -Leaf $requirementsPath)"
+                Content = (Get-PythonProjectRequirementsContent)
+                WithoutBom = $false
+            })
+    }
+    else {
+        $requirementsFile = $datedRequirementsFiles | Sort-Object Name -Descending | Select-Object -First 1
+        $requirementsContent = [System.IO.File]::ReadAllText($requirementsFile.FullName, [System.Text.Encoding]::UTF8)
+        $requirementsUpdateResult = Get-PythonRequirementsHeaderUpdateResult -Content $requirementsContent
+        if ($requirementsUpdateResult.HasChanges) {
+            $changes.Add([PSCustomObject]@{
+                    Type = 'WriteFile'
+                    Path = $requirementsFile.FullName
+                    Description = "Compléter $($requirementsFile.Name)"
+                    Content = $requirementsUpdateResult.Content
+                    WithoutBom = $false
+                    MissingEntries = @($requirementsUpdateResult.MissingLines)
+                })
+        }
+    }
+
+    $gitIgnorePath = Join-Path -Path $ProjectPath -ChildPath '.gitignore'
+    if (-not (Test-Path -LiteralPath $gitIgnorePath)) {
+        $changes.Add([PSCustomObject]@{
+                Type = 'WriteFile'
+                Path = $gitIgnorePath
+                Description = 'Créer .gitignore'
+                Content = (Get-ProjectGitIgnoreContent -ProjectType 'py')
+                WithoutBom = $false
+            })
+    }
+    else {
+        $currentGitIgnoreContent = [System.IO.File]::ReadAllText($gitIgnorePath, [System.Text.Encoding]::UTF8)
+        $currentGitIgnoreLines = @(($currentGitIgnoreContent -replace "`r`n", "`n") -split "`n")
+        $missingGitIgnoreSections = @(Get-MissingGitIgnoreEntries -CurrentLines $currentGitIgnoreLines -ProjectType 'py')
+        if ($missingGitIgnoreSections.Count -gt 0) {
+            $missingEntries = @()
+            foreach ($section in $missingGitIgnoreSections) {
+                $missingEntries += @($section.Lines)
+            }
+
+            $changes.Add([PSCustomObject]@{
+                    Type = 'UpdateGitIgnore'
+                    Path = $gitIgnorePath
+                    Description = 'Compléter .gitignore'
+                    MissingEntries = @($missingEntries)
+                })
+        }
+    }
+
+    if ($finalHasVirtualEnvironment) {
+        $cmdVenvPath = Join-Path -Path $ProjectPath -ChildPath 'cmdVenv.cmd'
+        $expectedCmdVenvContent = Get-PythonProjectCmdVenvLauncherContent -ProjectName $ProjectName
+        if (-not (Test-Path -LiteralPath $cmdVenvPath)) {
+            $changes.Add([PSCustomObject]@{
+                    Type = 'WriteFile'
+                    Path = $cmdVenvPath
+                    Description = 'Créer cmdVenv.cmd'
+                    Content = $expectedCmdVenvContent
+                    WithoutBom = $true
+                    Category = 'Venv'
+                })
+        }
+        elseif (-not (Test-TextFileContentMatches -Path $cmdVenvPath -ExpectedContent $expectedCmdVenvContent)) {
+            $changes.Add([PSCustomObject]@{
+                    Type = 'WriteFile'
+                    Path = $cmdVenvPath
+                    Description = 'Mettre à jour cmdVenv.cmd'
+                    Content = $expectedCmdVenvContent
+                    WithoutBom = $true
+                    Category = 'Venv'
+                })
+        }
+    }
+
+    if ($WillCreateVirtualEnvironment) {
+        $changes.Add([PSCustomObject]@{
+                Type = 'CreateVenv'
+                Path = (Join-Path -Path $ProjectPath -ChildPath '.venv')
+                Description = 'Créer le venv Python ".venv"'
+                Category = 'Venv'
+            })
+    }
+
+    return [PSCustomObject]@{
+        FinalHasVirtualEnvironment = $finalHasVirtualEnvironment
+        Changes = @($changes)
+    }
+}
+
+function Show-ImportedPythonProjectSetupPlan {
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Changes = @()
+    )
+
+    Write-Host 'Changements proposés :' -ForegroundColor Cyan
+    foreach ($change in @($Changes)) {
+        Write-Host "- $($change.Description)" -ForegroundColor Cyan
+        $missingEntries = @()
+        if ($change.PSObject.Properties.Match('MissingEntries').Count -gt 0 -and $null -ne $change.MissingEntries) {
+            $missingEntries = @($change.MissingEntries)
+        }
+
+        if ($missingEntries.Count -gt 0) {
+            Write-Host "  Informations manquantes : $($missingEntries -join ', ')" -ForegroundColor DarkCyan
+        }
+    }
+}
+
+function Get-ImportedPythonProjectSetupChangesByCategory {
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Changes = @()
+    )
+
+    $venvChanges = [System.Collections.Generic.List[object]]::new()
+    $supplementalChanges = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($change in @($Changes)) {
+        $category = if ($change.PSObject.Properties.Match('Category').Count -gt 0) {
+            "$($change.Category)"
+        }
+        else {
+            ''
+        }
+
+        if ($category -eq 'Venv') {
+            $venvChanges.Add($change)
+        }
+        else {
+            $supplementalChanges.Add($change)
+        }
+    }
+
+    return [PSCustomObject]@{
+        VenvChanges = @($venvChanges)
+        SupplementalChanges = @($supplementalChanges)
+    }
+}
+
+function Read-ConfirmedPythonProjectSupplementalChanges {
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Changes = @()
+    )
+
+    $confirmedChanges = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($change in @($Changes)) {
+        Show-ImportedPythonProjectSetupPlan -Changes @($change)
+        $confirmChange = Read-ConfirmationWithDefault -Prompt 'Confirmer ce changement pour ce projet Python ?' -DefaultValue $true
+        if ($confirmChange) {
+            $confirmedChanges.Add($change)
+        }
+        else {
+            Write-Host "Changement ignoré à votre demande : $($change.Description)" -ForegroundColor Yellow
+        }
+    }
+
+    return @($confirmedChanges.ToArray())
+}
+
+function Apply-ConfirmedPythonProjectSupplementalChanges {
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Changes = @(),
+
+        [AllowNull()]
+        [System.Collections.Generic.List[string]] $AppliedChangedPaths
+    )
+
+    if (@($Changes).Count -eq 0) {
+        return
+    }
+
+    $confirmedSupplementalChanges = @(Read-ConfirmedPythonProjectSupplementalChanges -Changes $Changes)
+    if ($confirmedSupplementalChanges.Count -eq 0) {
+        Write-Host 'Les compléments de fichiers ont été ignorés à votre demande.' -ForegroundColor Yellow
+        return
+    }
+
+    if ($null -eq $AppliedChangedPaths) {
+        $AppliedChangedPaths = [System.Collections.Generic.List[string]]::new()
+    }
+
+    Invoke-ImportedPythonProjectSetupPlan -Changes $confirmedSupplementalChanges
+    foreach ($changedPath in @(Get-ChangedPathsFromSetupChanges -Changes $confirmedSupplementalChanges)) {
+        if ($AppliedChangedPaths -notcontains $changedPath) {
+            $AppliedChangedPaths.Add($changedPath)
+        }
+    }
+}
+
+function Invoke-ImportedPythonProjectSetupPlan {
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Changes = @()
+    )
+
+    foreach ($change in @($Changes)) {
+        switch ($change.Type) {
+            'WriteFile' {
+                Write-Utf8TextFile -Path $change.Path -Content $change.Content -WithoutBom:([bool] $change.WithoutBom)
+                Write-Host "$($change.Description) : $($change.Path)" -ForegroundColor Green
+            }
+            'UpdateGitIgnore' {
+                Update-ProjectGitIgnoreFile -ProjectPath (Split-Path -Path $change.Path -Parent) -ProjectType 'py' | Out-Null
+            }
+        }
+    }
+}
+
+function ConvertTo-NormalizedPathList {
+    param(
+        [AllowNull()]
+        [object[]] $Paths = @()
+    )
+
+    $normalizedPaths = [System.Collections.Generic.List[string]]::new()
+    $pendingValues = [System.Collections.Generic.Queue[object]]::new()
+
+    foreach ($pathValue in @($Paths)) {
+        $pendingValues.Enqueue($pathValue)
+    }
+
+    while ($pendingValues.Count -gt 0) {
+        $currentValue = $pendingValues.Dequeue()
+        if ($null -eq $currentValue) {
+            continue
+        }
+
+        if ($currentValue -is [string]) {
+            $currentPath = $currentValue.Trim()
+            if ([string]::IsNullOrWhiteSpace($currentPath)) {
+                continue
+            }
+
+            $normalizedPath = Get-NormalizedPath -Path $currentPath
+            if ($normalizedPaths -notcontains $normalizedPath) {
+                $normalizedPaths.Add($normalizedPath)
+            }
+
+            continue
+        }
+
+        if ($currentValue -is [System.Collections.IEnumerable]) {
+            foreach ($nestedValue in @($currentValue)) {
+                $pendingValues.Enqueue($nestedValue)
+            }
+
+            continue
+        }
+
+        $currentPath = "$currentValue".Trim()
+        if ([string]::IsNullOrWhiteSpace($currentPath)) {
+            continue
+        }
+
+        $normalizedPath = Get-NormalizedPath -Path $currentPath
+        if ($normalizedPaths -notcontains $normalizedPath) {
+            $normalizedPaths.Add($normalizedPath)
+        }
+    }
+
+    return @($normalizedPaths.ToArray())
+}
+
+function New-ProjectSetupResult {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $ProjectConfig,
+
+        [AllowEmptyCollection()]
+        [string[]] $ChangedPaths = @()
+    )
+
+    $normalizedChangedPaths = [System.Collections.Generic.List[string]]::new()
+    foreach ($normalizedPath in @(ConvertTo-NormalizedPathList -Paths $ChangedPaths)) {
+        if ($normalizedChangedPaths -notcontains $normalizedPath) {
+            $normalizedChangedPaths.Add($normalizedPath)
+        }
+    }
+
+    return [PSCustomObject]@{
+        ProjectConfig = $ProjectConfig
+        ChangedPaths = @($normalizedChangedPaths.ToArray())
+    }
+}
+
+function Get-ChangedPathsFromSetupChanges {
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Changes = @()
+    )
+
+    $changedPaths = [System.Collections.Generic.List[string]]::new()
+    foreach ($change in @($Changes)) {
+        if ($change.PSObject.Properties.Match('Path').Count -eq 0) {
+            continue
+        }
+
+        foreach ($normalizedPath in @(ConvertTo-NormalizedPathList -Paths $change.Path)) {
+            if ($changedPaths -notcontains $normalizedPath) {
+                $changedPaths.Add($normalizedPath)
+            }
+        }
+    }
+
+    return @($changedPaths.ToArray())
+}
+
+function Update-ExistingProjectSetup {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ConfigPath,
+
+        [Parameter(Mandatory = $true)]
+        [object] $ProjectConfig,
+
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath,
+
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectName,
+
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $ProjectType,
+
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $CustomProjectType
+    )
+
+    if (Test-PythonProjectPath -ProjectPath $ProjectPath) {
+        return Initialize-ImportedPythonProjectEnvironment `
+            -ConfigPath $ConfigPath `
+            -ProjectConfig $ProjectConfig `
+            -ProjectPath $ProjectPath `
+            -ProjectName $ProjectName
+    }
+
+    $projectTypeSelection = Resolve-ProjectTypeSelection `
+        -ProjectType $ProjectType `
+        -DefaultProjectType $ProjectConfig.DefaultProjectType `
+        -CustomProjectType $CustomProjectType
+    $projectTypeToUpdate = $projectTypeSelection.NormalizedProjectType
+    $gitIgnorePath = Join-Path -Path $ProjectPath -ChildPath '.gitignore'
+    $changes = [System.Collections.Generic.List[object]]::new()
+
+    if (-not (Test-Path -LiteralPath $gitIgnorePath)) {
+        $changes.Add([PSCustomObject]@{
+                Type = 'WriteFile'
+                Path = $gitIgnorePath
+                Description = 'Créer .gitignore'
+                Content = (Get-ProjectGitIgnoreContent -ProjectType $projectTypeToUpdate)
+                WithoutBom = $false
+            })
+    }
+    else {
+        $currentGitIgnoreContent = [System.IO.File]::ReadAllText($gitIgnorePath, [System.Text.Encoding]::UTF8)
+        $currentGitIgnoreLines = @(($currentGitIgnoreContent -replace "`r`n", "`n") -split "`n")
+        $missingGitIgnoreSections = @(Get-MissingGitIgnoreEntries -CurrentLines $currentGitIgnoreLines -ProjectType $projectTypeToUpdate)
+        if ($missingGitIgnoreSections.Count -gt 0) {
+            $missingEntries = @()
+            foreach ($section in $missingGitIgnoreSections) {
+                $missingEntries += @($section.Lines)
+            }
+
+            $changes.Add([PSCustomObject]@{
+                    Type = 'UpdateGitIgnore'
+                    Path = $gitIgnorePath
+                    Description = 'Compléter .gitignore'
+                    MissingEntries = @($missingEntries)
+                })
+        }
+    }
+
+    if ($changes.Count -eq 0) {
+        Write-Host 'Le projet existant est déjà à jour pour ce type.' -ForegroundColor Green
+        return New-ProjectSetupResult -ProjectConfig $ProjectConfig
+    }
+
+    Show-ImportedPythonProjectSetupPlan -Changes @($changes)
+    $confirmChanges = Read-ConfirmationWithDefault -Prompt 'Confirmer ces changements pour le projet existant ?' -DefaultValue $true
+    if (-not $confirmChanges) {
+        Write-Host 'Aucune modification automatique appliquée au projet existant.' -ForegroundColor Yellow
+        return New-ProjectSetupResult -ProjectConfig $ProjectConfig
+    }
+
+    Invoke-ImportedPythonProjectSetupPlan -Changes @($changes)
+    return New-ProjectSetupResult `
+        -ProjectConfig $ProjectConfig `
+        -ChangedPaths (Get-ChangedPathsFromSetupChanges -Changes @($changes))
+}
+
+function Initialize-ImportedPythonProjectEnvironment {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ConfigPath,
+
+        [Parameter(Mandatory = $true)]
+        [object] $ProjectConfig,
+
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath,
+
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectName
+    )
+
+    if (-not (Test-PythonProjectPath -ProjectPath $ProjectPath)) {
+        return New-ProjectSetupResult -ProjectConfig $ProjectConfig
+    }
+
+    $recommendedPythonVersionInfo = Get-RecommendedPythonVersionInfoFromProjectPath -ProjectPath $ProjectPath
+    $recommendedPythonVersionRequest = $recommendedPythonVersionInfo.VersionRequest
+
+    if (-not [string]::IsNullOrWhiteSpace("$recommendedPythonVersionRequest")) {
+        if ($recommendedPythonVersionInfo.Source -eq 'venv') {
+            Write-Host "Version Python recommandée déduite du venv local : $recommendedPythonVersionRequest" -ForegroundColor Cyan
+        }
+        else {
+            Write-Host "Version Python recommandée détectée dans pyproject.toml : $recommendedPythonVersionRequest" -ForegroundColor Cyan
+        }
+    }
+
+    $venvPath = Join-Path -Path $ProjectPath -ChildPath '.venv'
+    $hasExistingVirtualEnvironment = Test-Path -LiteralPath $venvPath
+    $shouldCreatePythonVenv = $false
+    if (-not $hasExistingVirtualEnvironment) {
+        $shouldCreatePythonVenv = Read-CreatePythonVenv -DefaultCreatePythonVenv $ProjectConfig.DefaultCreatePythonVenv
+    }
+
+    $setupPlan = Get-ImportedPythonProjectSetupPlan `
+        -ProjectPath $ProjectPath `
+        -ProjectName $ProjectName `
+        -WillCreateVirtualEnvironment $shouldCreatePythonVenv `
+        -RecommendedPythonVersionRequest $recommendedPythonVersionRequest
+
+    $categorizedChanges = Get-ImportedPythonProjectSetupChangesByCategory -Changes $setupPlan.Changes
+    $venvChanges = @($categorizedChanges.VenvChanges)
+    $supplementalChanges = @($categorizedChanges.SupplementalChanges)
+
+    if ($venvChanges.Count -gt 0) {
+        Write-Host 'Préparation du venv :' -ForegroundColor Cyan
+        foreach ($venvChange in $venvChanges) {
+            Write-Host "- $($venvChange.Description)" -ForegroundColor Cyan
+        }
+    }
+
+    if ($supplementalChanges.Count -eq 0 -and $venvChanges.Count -eq 0) {
+        Write-Host 'Le projet Python est déjà à jour.' -ForegroundColor Green
+        return New-ProjectSetupResult -ProjectConfig $ProjectConfig
+    }
+
+    $appliedChangedPaths = [System.Collections.Generic.List[string]]::new()
+
+    if ($venvChanges.Count -gt 0) {
+        Invoke-ImportedPythonProjectSetupPlan -Changes $venvChanges
+        foreach ($changedPath in @(Get-ChangedPathsFromSetupChanges -Changes $venvChanges)) {
+            if ($appliedChangedPaths -notcontains $changedPath) {
+                $appliedChangedPaths.Add($changedPath)
+            }
+        }
+    }
+
+    if (-not $shouldCreatePythonVenv) {
+        Apply-ConfirmedPythonProjectSupplementalChanges `
+            -Changes $supplementalChanges `
+            -AppliedChangedPaths $appliedChangedPaths
+        return New-ProjectSetupResult -ProjectConfig $ProjectConfig -ChangedPaths @($appliedChangedPaths)
+    }
+
+    Write-StepInfo 'Recherche des versions Python connues...'
+    $updatedConfig = Sync-ProjectPythonInterpreters -ConfigPath $ConfigPath -ProjectConfig $ProjectConfig
+    $pythonSelection = Select-PythonInterpreterForVenv `
+        -ConfigPath $ConfigPath `
+        -ProjectConfig $updatedConfig `
+        -PreferredVersionRequest $recommendedPythonVersionRequest
+    $updatedConfig = $pythonSelection.ProjectConfig
+    New-PythonVirtualEnvironment -ProjectPath $ProjectPath -PythonInterpreter $pythonSelection.Interpreter | Out-Null
+
+    $selectedPythonVersionRequest = Get-RecommendedPythonVersionRequestFromVersionText -VersionText $pythonSelection.Interpreter.Version
+    $postVenvSetupPlan = Get-ImportedPythonProjectSetupPlan `
+        -ProjectPath $ProjectPath `
+        -ProjectName $ProjectName `
+        -WillCreateVirtualEnvironment $true `
+        -RecommendedPythonVersionRequest $selectedPythonVersionRequest
+    $postVenvCategorizedChanges = Get-ImportedPythonProjectSetupChangesByCategory -Changes $postVenvSetupPlan.Changes
+    Apply-ConfirmedPythonProjectSupplementalChanges `
+        -Changes $postVenvCategorizedChanges.SupplementalChanges `
+        -AppliedChangedPaths $appliedChangedPaths
+
+    return New-ProjectSetupResult -ProjectConfig $updatedConfig -ChangedPaths @($appliedChangedPaths)
+}
+
+function Ensure-LocalGitRepositoryReady {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath
+    )
+
+    $gitCommand = Get-GitCommand
+    if ($null -eq $gitCommand) {
+        throw "Git n'est pas installé. Impossible de créer automatiquement le dépôt GitHub."
+    }
+
+    if (-not (Test-Path -LiteralPath (Join-Path -Path $ProjectPath -ChildPath '.git'))) {
+        $initResult = Invoke-GitCommandCapture -Arguments @('-C', $ProjectPath, 'init') -WaitMessage 'Initialisation du dépôt Git local'
+        foreach ($outputLine in $initResult.OutputLines) {
+            if (-not [string]::IsNullOrWhiteSpace("$outputLine")) {
+                Write-Host $outputLine
+            }
+        }
+
+        if (-not $initResult.Success) {
+            throw "Impossible d'initialiser le dépôt Git local dans '$ProjectPath'."
+        }
+    }
+
+    $branchResult = Invoke-GitCommandCapture -Arguments @('-C', $ProjectPath, 'branch', '-M', 'main')
+    if ($null -eq $branchResult -or -not $branchResult.Success) {
+        throw "Impossible de positionner la branche Git principale sur 'main'."
+    }
+
+    $headResult = Invoke-GitCommandCapture -Arguments @('-C', $ProjectPath, 'rev-parse', '--verify', 'HEAD')
+    if ($null -ne $headResult -and $headResult.Success) {
+        return
+    }
+
+    $addResult = Invoke-GitCommandCapture -Arguments @('-C', $ProjectPath, 'add', '.')
+    if ($null -eq $addResult -or -not $addResult.Success) {
+        throw "Impossible d'ajouter les fichiers du projet au dépôt Git local."
+    }
+
+    $commitResult = Invoke-GitCommandCapture -Arguments @('-C', $ProjectPath, 'commit', '-m', 'Initialisation du projet')
+    foreach ($outputLine in $commitResult.OutputLines) {
+        if (-not [string]::IsNullOrWhiteSpace("$outputLine")) {
+            Write-Host $outputLine
+        }
+    }
+
+    if (-not $commitResult.Success) {
+        if (($commitResult.OutputLines -join ' ') -match '(?i)(user\.name|user\.email|unable to auto-detect email address|author identity unknown)') {
+            throw 'Git n''est pas encore configuré avec user.name et user.email. Configurez Git puis relancez le script pour créer automatiquement le dépôt GitHub.'
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($commitResult.ErrorMessage)) {
+            throw "Impossible de créer le commit Git initial : $($commitResult.ErrorMessage)"
+        }
+
+        throw 'Impossible de créer le commit Git initial.'
+    }
+}
+
+function Test-GitRepositoryExists {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath
+    )
+
+    return (Test-Path -LiteralPath (Join-Path -Path $ProjectPath -ChildPath '.git'))
+}
+
+function Get-GitWorkingTreeStatusLines {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath
+    )
+
+    $result = Invoke-GitCommandCapture -Arguments @('-C', $ProjectPath, 'status', '--porcelain')
+    if ($null -eq $result -or -not $result.Success) {
+        return @()
+    }
+
+    return @($result.OutputLines | Where-Object { -not [string]::IsNullOrWhiteSpace("$_") })
+}
+
+function Get-GitWorkingTreeChangedPaths {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath
+    )
+
+    $changedPaths = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($statusLine in @(Get-GitWorkingTreeStatusLines -ProjectPath $ProjectPath)) {
+        $statusText = "$statusLine"
+        if ([string]::IsNullOrWhiteSpace($statusText) -or $statusText.Length -lt 4) {
+            continue
+        }
+
+        $relativePath = $statusText.Substring(3).Trim()
+        if ($relativePath.Contains(' -> ')) {
+            $relativePath = ($relativePath -split ' -> ' | Select-Object -Last 1).Trim()
+        }
+
+        if ([string]::IsNullOrWhiteSpace($relativePath)) {
+            continue
+        }
+
+        $absolutePath = Join-Path -Path $ProjectPath -ChildPath $relativePath
+        $normalizedPath = Get-NormalizedPathCandidate -Path $absolutePath
+        if ($changedPaths -notcontains $normalizedPath) {
+            $changedPaths.Add($normalizedPath)
+        }
+    }
+
+    return ,@($changedPaths)
+}
+
+function Test-GitWorkingTreeHasChanges {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath
+    )
+
+    return (@(Get-GitWorkingTreeStatusLines -ProjectPath $ProjectPath).Count -gt 0)
+}
+
+function Get-GitOriginRemoteUrl {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath
+    )
+
+    $result = Invoke-GitCommandCapture -Arguments @('-C', $ProjectPath, 'remote', 'get-url', 'origin')
+    if ($null -eq $result -or -not $result.Success) {
+        return ''
+    }
+
+    foreach ($outputLine in @($result.OutputLines)) {
+        $outputText = "$outputLine".Trim()
+        if (-not [string]::IsNullOrWhiteSpace($outputText)) {
+            return $outputText
+        }
+    }
+
+    return ''
+}
+
+function Test-GitHubOriginRemote {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath
+    )
+
+    $originRemoteUrl = Get-GitOriginRemoteUrl -ProjectPath $ProjectPath
+    if ([string]::IsNullOrWhiteSpace($originRemoteUrl)) {
+        return $false
+    }
+
+    return ($originRemoteUrl -match '(?i)github\.com[:/]')
+}
+
+function Get-ProjectRelativePath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath,
+
+        [Parameter(Mandatory = $true)]
+        [string] $TargetPath
+    )
+
+    $normalizedProjectPath = [System.IO.Path]::GetFullPath((Get-NormalizedPath -Path $ProjectPath))
+    $normalizedTargetPath = [System.IO.Path]::GetFullPath((Get-NormalizedPath -Path $TargetPath))
+
+    if (-not $normalizedTargetPath.StartsWith($normalizedProjectPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Le chemin '$normalizedTargetPath' n'appartient pas au projet '$normalizedProjectPath'."
+    }
+
+    $relativePath = $normalizedTargetPath.Substring($normalizedProjectPath.Length).TrimStart('\', '/')
+    if ([string]::IsNullOrWhiteSpace($relativePath)) {
+        return '.'
+    }
+
+    return $relativePath
+}
+
+function Get-GitCurrentBranchName {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath
+    )
+
+    $result = Invoke-GitCommandCapture -Arguments @('-C', $ProjectPath, 'branch', '--show-current')
+    if ($null -eq $result -or -not $result.Success) {
+        return ''
+    }
+
+    foreach ($outputLine in @($result.OutputLines)) {
+        $branchName = "$outputLine".Trim()
+        if (-not [string]::IsNullOrWhiteSpace($branchName)) {
+            return $branchName
+        }
+    }
+
+    return ''
+}
+
+function Sync-UpdatedProjectToGitHub {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath,
+
+        [AllowEmptyCollection()]
+        [string[]] $ChangedPaths = @()
+    )
+
+    if (-not (Test-GitRepositoryExists -ProjectPath $ProjectPath)) {
+        Write-Host 'Aucun dépôt Git local détecté. Synchronisation GitHub ignorée.' -ForegroundColor Yellow
+        return
+    }
+
+    Write-StepInfo 'Préparation de la synchronisation GitHub de la mise à jour...'
+
+    $normalizedChangedPaths = @(Get-ChangedPathsFromSetupChanges -Changes @(
+            foreach ($changedPath in @($ChangedPaths)) {
+                [PSCustomObject]@{ Path = $changedPath }
+            }
+        ))
+    if ($normalizedChangedPaths.Count -eq 0) {
+        Write-Host 'Aucun fichier modifié à synchroniser vers GitHub.' -ForegroundColor Yellow
+        return
+    }
+
+    if (-not (Test-GitRepositoryHasOriginRemote -ProjectPath $ProjectPath)) {
+        Write-Host "Dépôt Git local détecté, mais aucun remote 'origin' n'est configuré. Mise à jour GitHub ignorée." -ForegroundColor Yellow
+        return
+    }
+
+    if (-not (Test-GitHubOriginRemote -ProjectPath $ProjectPath)) {
+        Write-Host "Le remote 'origin' n'est pas un dépôt GitHub. Push GitHub ignoré." -ForegroundColor Yellow
+        return
+    }
+
+    $relativeChangedPaths = [System.Collections.Generic.List[string]]::new()
+    foreach ($changedPath in @($normalizedChangedPaths)) {
+        try {
+            $relativeChangedPath = Get-ProjectRelativePath -ProjectPath $ProjectPath -TargetPath $changedPath
+            if ($relativeChangedPaths -notcontains $relativeChangedPath) {
+                $relativeChangedPaths.Add($relativeChangedPath)
+            }
+        }
+        catch {
+            continue
+        }
+    }
+
+    if ($relativeChangedPaths.Count -eq 0) {
+        Write-Host 'Aucun fichier du script n''a pu être relié au dépôt Git pour la synchronisation GitHub.' -ForegroundColor Yellow
+        return
+    }
+
+    $stagedCandidatePaths = [System.Collections.Generic.List[string]]::new()
+    foreach ($relativeChangedPath in @($relativeChangedPaths.ToArray())) {
+        $addResult = Invoke-GitCommandCapture `
+            -Arguments @('-C', $ProjectPath, 'add', '--', $relativeChangedPath) `
+            -WaitMessage "Préparation Git du fichier $relativeChangedPath"
+        if ($null -ne $addResult -and $addResult.Success) {
+            if ($stagedCandidatePaths -notcontains $relativeChangedPath) {
+                $stagedCandidatePaths.Add($relativeChangedPath)
+            }
+
+            continue
+        }
+
+        $addOutputText = ''
+        if ($null -ne $addResult) {
+            $addOutputText = (@($addResult.OutputLines) -join ' ').Trim()
+        }
+
+        if ($addOutputText -match '(?i)ignored by one of your \.gitignore files') {
+            Write-Host "Fichier ignoré par Git, non synchronisé : $relativeChangedPath" -ForegroundColor Yellow
+            continue
+        }
+
+        Write-Host "Impossible de préparer le fichier Git '$relativeChangedPath'. Il sera ignoré pour le push." -ForegroundColor Yellow
+    }
+
+    if ($stagedCandidatePaths.Count -eq 0) {
+        Write-Host 'Aucun fichier modifié du script n''a pu être préparé pour Git.' -ForegroundColor Yellow
+        return
+    }
+
+    $stagedResult = Invoke-GitCommandCapture -Arguments (@('-C', $ProjectPath, 'diff', '--cached', '--name-only', '--') + $stagedCandidatePaths.ToArray())
+    $stagedFiles = @(
+        if ($null -eq $stagedResult -or -not $stagedResult.Success) {
+            @()
+        }
+        else {
+            @($stagedResult.OutputLines | Where-Object { -not [string]::IsNullOrWhiteSpace("$_") })
+        }
+    )
+
+    if ($stagedFiles.Count -eq 0) {
+        Write-Host 'Aucun changement de mise à jour à envoyer vers GitHub.' -ForegroundColor Yellow
+        return
+    }
+
+    $commitResult = Invoke-GitCommandCapture -Arguments @('-C', $ProjectPath, 'commit', '-m', 'Mise à jour du projet via prepare-nouveau-projet.ps1') -WaitMessage 'Création du commit Git de mise à jour'
+    foreach ($outputLine in @($commitResult.OutputLines)) {
+        if (-not [string]::IsNullOrWhiteSpace("$outputLine")) {
+            Write-Host $outputLine
+        }
+    }
+
+    if ($null -eq $commitResult -or -not $commitResult.Success) {
+        if (($commitResult.OutputLines -join ' ') -match '(?i)(user\.name|user\.email|unable to auto-detect email address|author identity unknown)') {
+            Write-Host 'Git n''est pas encore configuré avec user.name et user.email. Push GitHub ignoré.' -ForegroundColor Yellow
+            return
+        }
+
+        Write-Host 'Impossible de créer le commit Git de mise à jour. Push GitHub ignoré.' -ForegroundColor Yellow
+        return
+    }
+
+    $pushResult = Invoke-GitCommandCapture -Arguments @('-C', $ProjectPath, 'push') -WaitMessage 'Push GitHub en cours'
+    foreach ($outputLine in @($pushResult.OutputLines)) {
+        if (-not [string]::IsNullOrWhiteSpace("$outputLine")) {
+            Write-Host $outputLine
+        }
+    }
+
+    if ($null -ne $pushResult -and $pushResult.Success) {
+        Write-Host 'Mise à jour GitHub effectuée.' -ForegroundColor Green
+        return
+    }
+
+    $currentBranchName = Get-GitCurrentBranchName -ProjectPath $ProjectPath
+    if ([string]::IsNullOrWhiteSpace($currentBranchName)) {
+        Write-Host 'Impossible de déterminer la branche Git courante. Push GitHub ignoré.' -ForegroundColor Yellow
+        return
+    }
+
+    $pushResult = Invoke-GitCommandCapture -Arguments @('-C', $ProjectPath, 'push', '-u', 'origin', $currentBranchName) -WaitMessage 'Push GitHub en cours'
+    foreach ($outputLine in @($pushResult.OutputLines)) {
+        if (-not [string]::IsNullOrWhiteSpace("$outputLine")) {
+            Write-Host $outputLine
+        }
+    }
+
+    if ($null -eq $pushResult -or -not $pushResult.Success) {
+        Write-Host 'Impossible d''envoyer la mise à jour vers GitHub.' -ForegroundColor Yellow
+        return
+    }
+
+    Write-Host 'Mise à jour GitHub effectuée.' -ForegroundColor Green
+}
+
+function Sync-ProjectSetupResultToGitHubIfNeeded {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath,
+
+        [AllowNull()]
+        [object] $ProjectSetupResult
+    )
+
+    if (-not (Test-GitRepositoryExists -ProjectPath $ProjectPath)) {
+        return
+    }
+
+    if (Test-GitWorkingTreeHasChanges -ProjectPath $ProjectPath) {
+        Write-Host 'Le dépôt Git local contient déjà des modifications non validées. Le script ne synchronisera que les fichiers qu''il a lui-même mis à jour.' -ForegroundColor Yellow
+    }
+
+    $changedPathsToSync = @()
+    if ($null -ne $ProjectSetupResult -and $ProjectSetupResult.PSObject.Properties.Match('ChangedPaths').Count -gt 0) {
+        $changedPathsToSync = @($ProjectSetupResult.ChangedPaths)
+    }
+
+    if ($changedPathsToSync.Count -eq 0) {
+        $changedPathsToSync = @(Get-GitWorkingTreeChangedPaths -ProjectPath $ProjectPath)
+    }
+
+    Sync-UpdatedProjectToGitHub `
+        -ProjectPath $ProjectPath `
+        -ChangedPaths $changedPathsToSync
+}
+
+function New-GitHubRepositoryForProject {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath,
+
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectName,
+
+        [Parameter(Mandatory = $true)]
+        [string] $Visibility
+    )
+
+    $gitHubCliCommand = Get-GitHubCliCommand
+    if ($null -eq $gitHubCliCommand) {
+        return
+    }
+
+    if (Test-GitRepositoryHasOriginRemote -ProjectPath $ProjectPath) {
+        Write-Host "Un remote Git 'origin' existe déjà pour '$ProjectPath'. Création GitHub ignorée." -ForegroundColor Yellow
+        return
+    }
+
+    $normalizedVisibility = Get-NormalizedGitHubRepositoryVisibilitySetting `
+        -Visibility $Visibility `
+        -AllowDefault `
+        -DefaultVisibility $FallbackGitHubRepositoryVisibility
+    $repositoryName = Get-NormalizedGitHubRepositoryName -ProjectName $ProjectName
+
+    if (-not (Ensure-GitHubCliAuthentication)) {
+        return
+    }
+
+    Ensure-LocalGitRepositoryReady -ProjectPath $ProjectPath
+
+    $ghArguments = @('repo', 'create', $repositoryName, "--$normalizedVisibility", '--source', $ProjectPath, '--remote', 'origin', '--push')
+    Write-Host "Dépôt GitHub demandé : $repositoryName ($normalizedVisibility)" -ForegroundColor Cyan
+    Write-Host "Commande exécutée : $($gitHubCliCommand.CommandName) $($ghArguments -join ' ')" -ForegroundColor DarkCyan
+    $result = Invoke-GitHubCliCommandCapture -Arguments $ghArguments -WaitMessage 'Création du dépôt GitHub en cours'
+
+    if ($null -eq $result) {
+        throw "GitHub CLI 'gh' est introuvable."
+    }
+
+    foreach ($outputLine in $result.OutputLines) {
+        if (-not [string]::IsNullOrWhiteSpace("$outputLine")) {
+            Write-Host $outputLine
+        }
+    }
+
+    if (-not $result.Success) {
+        if (-not [string]::IsNullOrWhiteSpace($result.ErrorMessage)) {
+            throw "Impossible de créer le dépôt GitHub '$repositoryName' : $($result.ErrorMessage)"
+        }
+
+        throw "Impossible de créer le dépôt GitHub '$repositoryName'."
+    }
+
+    Write-Host "Dépôt GitHub créé : $repositoryName" -ForegroundColor Green
 }
 
 function Resolve-ProjectTypeSelection {
@@ -1602,6 +3909,7 @@ function Resolve-ProjectTarget {
         if (-not (Test-Path -LiteralPath $projectPath)) {
             return [PSCustomObject]@{
                 Cancelled = $false
+                UseExistingProject = $false
                 ProjectName = $resolvedProjectName
                 ProjectPath = $projectPath
             }
@@ -1613,6 +3921,16 @@ function Resolve-ProjectTarget {
             Write-Host 'Aucune modification effectuée.' -ForegroundColor Yellow
             return [PSCustomObject]@{
                 Cancelled = $true
+                UseExistingProject = $false
+                ProjectName = $resolvedProjectName
+                ProjectPath = $projectPath
+            }
+        }
+
+        if ($action -eq 'Update') {
+            return [PSCustomObject]@{
+                Cancelled = $false
+                UseExistingProject = $true
                 ProjectName = $resolvedProjectName
                 ProjectPath = $projectPath
             }
@@ -1642,23 +3960,52 @@ function New-ProjectDirectory {
     return $targetPath
 }
 
-function New-PythonProjectReadme {
+function Get-PythonRequirementsFileName {
+    param(
+        [datetime] $Date = (Get-Date)
+    )
+
+    return ('{0:yyyy-MM-dd}requirements.txt' -f $Date)
+}
+
+function Get-NormalizedPythonDistributionName {
     param(
         [Parameter(Mandatory = $true)]
-        [string] $ProjectPath,
+        [string] $ProjectName
+    )
 
+    $asciiFriendlyName = (Get-TextWithoutDiacritics -Text $ProjectName).ToLowerInvariant()
+    $distributionName = [System.Text.RegularExpressions.Regex]::Replace($asciiFriendlyName, '[^a-z0-9._-]+', '-')
+    $distributionName = [System.Text.RegularExpressions.Regex]::Replace($distributionName, '-{2,}', '-').Trim('-')
+
+    if ([string]::IsNullOrWhiteSpace($distributionName)) {
+        return 'mon-projet-python'
+    }
+
+    return $distributionName
+}
+
+function Get-PythonVenvPromptLabel {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectName
+    )
+
+    $projectLabel = [System.Text.RegularExpressions.Regex]::Replace((Get-TextWithoutDiacritics -Text $ProjectName), '[^A-Za-z0-9]+', '')
+    if ([string]::IsNullOrWhiteSpace($projectLabel)) {
+        return 'venvProjet'
+    }
+
+    return "venv$projectLabel"
+}
+
+function Get-PythonProjectReadmeContent {
+    param(
         [Parameter(Mandatory = $true)]
         [string] $ProjectName,
 
         [bool] $HasVirtualEnvironment = $false
     )
-
-    $readmePath = Join-Path -Path $ProjectPath -ChildPath 'README.md'
-
-    if (Test-Path -LiteralPath $readmePath) {
-        Write-Host "README déjà présent : $readmePath" -ForegroundColor Yellow
-        return $readmePath
-    }
 
     $quickStartLines = [System.Collections.Generic.List[string]]::new()
 
@@ -1689,18 +4036,41 @@ function New-PythonProjectReadme {
         '- Le venv local est prévu dans le dossier `.venv`.'
     )
 
-    $content = ($contentLines -join [Environment]::NewLine) + [Environment]::NewLine
+    return (($contentLines -join [Environment]::NewLine) + [Environment]::NewLine)
+}
+
+function New-PythonProjectReadme {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath,
+
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectName,
+
+        [bool] $HasVirtualEnvironment = $false
+    )
+
+    $readmePath = Join-Path -Path $ProjectPath -ChildPath 'README.md'
+
+    if (Test-Path -LiteralPath $readmePath) {
+        Write-Host "README déjà présent : $readmePath" -ForegroundColor Yellow
+        return $readmePath
+    }
+
+    $content = Get-PythonProjectReadmeContent -ProjectName $ProjectName -HasVirtualEnvironment $HasVirtualEnvironment
     Write-Utf8TextFile -Path $readmePath -Content $content
     Write-Host "README créé : $readmePath" -ForegroundColor Green
     return $readmePath
 }
 
-function Get-PythonRequirementsFileName {
-    param(
-        [datetime] $Date = (Get-Date)
+function Get-PythonProjectRequirementsContent {
+    $contentLines = @(
+        '# Dépendances Python du projet',
+        '# Ajoutez une dépendance par ligne, par exemple :',
+        '# requests==2.32.3'
     )
 
-    return ('{0:yyyy-MM-dd}requirements.txt' -f $Date)
+    return (($contentLines -join [Environment]::NewLine) + [Environment]::NewLine)
 }
 
 function New-PythonProjectRequirementsFile {
@@ -1719,73 +4089,187 @@ function New-PythonProjectRequirementsFile {
         return $requirementsPath
     }
 
-    $contentLines = @(
-        '# Dépendances Python du projet',
-        '# Ajoutez une dépendance par ligne, par exemple :',
-        '# requests==2.32.3'
-    )
-
-    $content = ($contentLines -join [Environment]::NewLine) + [Environment]::NewLine
+    $content = Get-PythonProjectRequirementsContent
     Write-Utf8TextFile -Path $requirementsPath -Content $content
     Write-Host "Fichier requirements créé : $requirementsPath" -ForegroundColor Green
     return $requirementsPath
 }
 
-function Get-NormalizedPythonDistributionName {
+function Get-NormalizedGitHubRepositoryName {
     param(
         [Parameter(Mandatory = $true)]
         [string] $ProjectName
     )
 
-    $normalizedText = $ProjectName.Normalize([Text.NormalizationForm]::FormD)
-    $builder = [System.Text.StringBuilder]::new()
+    $asciiFriendlyName = (Get-TextWithoutDiacritics -Text $ProjectName).ToLowerInvariant()
+    $repositoryName = [System.Text.RegularExpressions.Regex]::Replace($asciiFriendlyName, '[^a-z0-9._-]+', '-')
+    $repositoryName = [System.Text.RegularExpressions.Regex]::Replace($repositoryName, '-{2,}', '-').Trim('-')
 
-    foreach ($character in $normalizedText.ToCharArray()) {
-        $unicodeCategory = [Globalization.CharUnicodeInfo]::GetUnicodeCategory($character)
-        if ($unicodeCategory -eq [Globalization.UnicodeCategory]::NonSpacingMark) {
-            continue
-        }
-
-        [void] $builder.Append($character)
+    if ([string]::IsNullOrWhiteSpace($repositoryName)) {
+        return 'nouveau-projet'
     }
 
-    $asciiFriendlyName = $builder.ToString().Normalize([Text.NormalizationForm]::FormC).ToLowerInvariant()
-    $distributionName = [System.Text.RegularExpressions.Regex]::Replace($asciiFriendlyName, '[^a-z0-9._-]+', '-')
-    $distributionName = [System.Text.RegularExpressions.Regex]::Replace($distributionName, '-{2,}', '-').Trim('-')
-
-    if ([string]::IsNullOrWhiteSpace($distributionName)) {
-        return 'mon-projet-python'
-    }
-
-    return $distributionName
+    return $repositoryName
 }
 
-function Get-PythonVenvPromptLabel {
+function Get-RecommendedPythonVersionRequestFromVersionText {
     param(
-        [Parameter(Mandatory = $true)]
-        [string] $ProjectName
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $VersionText
     )
 
-    $normalizedText = $ProjectName.Normalize([Text.NormalizationForm]::FormD)
-    $builder = [System.Text.StringBuilder]::new()
+    $normalizedVersionText = if ($null -eq $VersionText) { '' } else { $VersionText.Trim() }
+    if ([string]::IsNullOrWhiteSpace($normalizedVersionText)) {
+        return $null
+    }
 
-    foreach ($character in $normalizedText.ToCharArray()) {
-        $unicodeCategory = [Globalization.CharUnicodeInfo]::GetUnicodeCategory($character)
-        if ($unicodeCategory -eq [Globalization.UnicodeCategory]::NonSpacingMark) {
-            continue
-        }
+    $versionMatch = [System.Text.RegularExpressions.Regex]::Match($normalizedVersionText, '\d+(?:\.\d+)+')
+    if (-not $versionMatch.Success) {
+        return $null
+    }
 
-        if ([char]::IsLetterOrDigit($character)) {
-            [void] $builder.Append($character)
+    $versionParts = @($versionMatch.Value.Split('.'))
+    if ($versionParts.Count -ge 2) {
+        return "$($versionParts[0]).$($versionParts[1])"
+    }
+
+    return $versionParts[0]
+}
+
+function Get-PythonRequiresVersionConstraint {
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $RecommendedVersionRequest
+    )
+
+    $normalizedRecommendedVersionRequest = Get-RecommendedPythonVersionRequestFromVersionText -VersionText $RecommendedVersionRequest
+    if ([string]::IsNullOrWhiteSpace("$normalizedRecommendedVersionRequest")) {
+        return $null
+    }
+
+    $versionParts = @($normalizedRecommendedVersionRequest.Split('.'))
+    if ($versionParts.Count -lt 2) {
+        return ">=${normalizedRecommendedVersionRequest}"
+    }
+
+    $majorVersion = [int] $versionParts[0]
+    $minorVersion = [int] $versionParts[1]
+    $nextMinorVersion = $minorVersion + 1
+    return ">=${majorVersion}.${minorVersion},<${majorVersion}.${nextMinorVersion}"
+}
+
+function Get-RecommendedPythonVersionRequestFromPyprojectPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $PyprojectPath
+    )
+
+    if (-not (Test-Path -LiteralPath $PyprojectPath)) {
+        return $null
+    }
+
+    $content = [System.IO.File]::ReadAllText($PyprojectPath, [System.Text.Encoding]::UTF8)
+    $requiresPythonMatch = [System.Text.RegularExpressions.Regex]::Match($content, '(?m)^\s*requires-python\s*=\s*["'']([^"'']+)["'']')
+    if (-not $requiresPythonMatch.Success) {
+        return $null
+    }
+
+    return Get-RecommendedPythonVersionRequestFromVersionText -VersionText $requiresPythonMatch.Groups[1].Value
+}
+
+function Get-RecommendedPythonVersionInfoFromProjectPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath
+    )
+
+    $pyprojectPath = Join-Path -Path $ProjectPath -ChildPath 'pyproject.toml'
+    $recommendedFromPyproject = Get-RecommendedPythonVersionRequestFromPyprojectPath -PyprojectPath $pyprojectPath
+    if (-not [string]::IsNullOrWhiteSpace("$recommendedFromPyproject")) {
+        return [PSCustomObject]@{
+            VersionRequest = $recommendedFromPyproject
+            Source = 'pyproject'
         }
     }
 
-    $projectLabel = $builder.ToString()
-    if ([string]::IsNullOrWhiteSpace($projectLabel)) {
-        return 'venvProjet'
+    $venvScriptsPath = Join-Path -Path $ProjectPath -ChildPath '.venv\Scripts'
+    if (-not (Test-Path -LiteralPath $venvScriptsPath)) {
+        return [PSCustomObject]@{
+            VersionRequest = $null
+            Source = $null
+        }
     }
 
-    return "venv$projectLabel"
+    try {
+        $venvPythonExecutablePath = Get-PythonExecutablePathFromDirectory -DirectoryPath $venvScriptsPath
+        $venvPythonVersion = Get-PythonVersionFromExecutablePath -PythonExecutablePath $venvPythonExecutablePath
+        $recommendedFromVenv = Get-RecommendedPythonVersionRequestFromVersionText -VersionText $venvPythonVersion
+        if (-not [string]::IsNullOrWhiteSpace("$recommendedFromVenv")) {
+            return [PSCustomObject]@{
+                VersionRequest = $recommendedFromVenv
+                Source = 'venv'
+            }
+        }
+    }
+    catch {
+    }
+
+    return [PSCustomObject]@{
+        VersionRequest = $null
+        Source = $null
+    }
+}
+
+function Test-PythonProjectPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath
+    )
+
+    if (Test-Path -LiteralPath (Join-Path -Path $ProjectPath -ChildPath 'pyproject.toml')) {
+        return $true
+    }
+
+    if ((Get-ChildItem -LiteralPath $ProjectPath -Filter '*.py' -File -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+        return $true
+    }
+
+    if ((Get-ChildItem -LiteralPath $ProjectPath -Filter '*requirements.txt' -File -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+        return $true
+    }
+
+    return $false
+}
+
+function Get-PythonProjectPyprojectContent {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectName,
+
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $RecommendedPythonVersionRequest = $null
+    )
+
+    $distributionName = Get-NormalizedPythonDistributionName -ProjectName $ProjectName
+    $requiresPythonConstraint = Get-PythonRequiresVersionConstraint -RecommendedVersionRequest $RecommendedPythonVersionRequest
+    $contentLines = @(
+        '[project]',
+        "name = ""$distributionName""",
+        'version = "0.1.0"',
+        "description = ""Projet Python $ProjectName""",
+        'readme = "README.md"',
+        $(if (-not [string]::IsNullOrWhiteSpace("$requiresPythonConstraint")) { "requires-python = ""$requiresPythonConstraint""" }),
+        'dependencies = []',
+        '',
+        '[build-system]',
+        'requires = ["setuptools>=61.0"]',
+        'build-backend = "setuptools.build_meta"'
+    ) | Where-Object { $_ -ne $null }
+
+    return (($contentLines -join [Environment]::NewLine) + [Environment]::NewLine)
 }
 
 function New-PythonProjectPyprojectFile {
@@ -1794,7 +4278,11 @@ function New-PythonProjectPyprojectFile {
         [string] $ProjectPath,
 
         [Parameter(Mandatory = $true)]
-        [string] $ProjectName
+        [string] $ProjectName,
+
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $RecommendedPythonVersionRequest = $null
     )
 
     $pyprojectPath = Join-Path -Path $ProjectPath -ChildPath 'pyproject.toml'
@@ -1804,24 +4292,62 @@ function New-PythonProjectPyprojectFile {
         return $pyprojectPath
     }
 
-    $distributionName = Get-NormalizedPythonDistributionName -ProjectName $ProjectName
-    $contentLines = @(
-        '[project]',
-        "name = ""$distributionName""",
-        'version = "0.1.0"',
-        "description = ""Projet Python $ProjectName""",
-        'readme = "README.md"',
-        'dependencies = []',
-        '',
-        '[build-system]',
-        'requires = ["setuptools>=61.0"]',
-        'build-backend = "setuptools.build_meta"'
-    )
-
-    $content = ($contentLines -join [Environment]::NewLine) + [Environment]::NewLine
+    $content = Get-PythonProjectPyprojectContent `
+        -ProjectName $ProjectName `
+        -RecommendedPythonVersionRequest $RecommendedPythonVersionRequest
     Write-Utf8TextFile -Path $pyprojectPath -Content $content
     Write-Host "pyproject.toml créé : $pyprojectPath" -ForegroundColor Green
     return $pyprojectPath
+}
+
+function Get-ProjectGitIgnoreSections {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectType
+    )
+
+    $sections = [System.Collections.Generic.List[object]]::new()
+    $sections.Add([PSCustomObject]@{
+            Title = '# Fichiers système et temporaires'
+            Lines = @('Thumbs.db', 'Desktop.ini', '*.tmp', '*.temp', '*.log')
+        })
+    $sections.Add([PSCustomObject]@{
+            Title = '# Dossiers et fichiers locaux'
+            Lines = @('.vscode/', '.idea/', '.env', '.env.*')
+        })
+
+    if ($ProjectType -eq 'py') {
+        $sections.Add([PSCustomObject]@{
+                Title = '# Python'
+                Lines = @('.venv/', 'cmdVenv.cmd', '__pycache__/', '*.pyc', '*.pyo', '*.pyd', '.pytest_cache/', '.mypy_cache/', '.ruff_cache/', 'build/', 'dist/', '*.egg-info/')
+            })
+    }
+
+    return @($sections)
+}
+
+function Get-ProjectGitIgnoreContent {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectType
+    )
+
+    $contentLines = [System.Collections.Generic.List[string]]::new()
+    $sections = @(Get-ProjectGitIgnoreSections -ProjectType $ProjectType)
+
+    for ($sectionIndex = 0; $sectionIndex -lt $sections.Count; $sectionIndex++) {
+        $section = $sections[$sectionIndex]
+        if ($sectionIndex -gt 0) {
+            $contentLines.Add('')
+        }
+
+        $contentLines.Add($section.Title)
+        foreach ($line in @($section.Lines)) {
+            $contentLines.Add($line)
+        }
+    }
+
+    return ((($contentLines.ToArray()) -join [Environment]::NewLine) + [Environment]::NewLine)
 }
 
 function New-ProjectGitIgnoreFile {
@@ -1840,57 +4366,17 @@ function New-ProjectGitIgnoreFile {
         return $gitIgnorePath
     }
 
-    $contentLines = [System.Collections.Generic.List[string]]::new()
-    $contentLines.Add('# Fichiers système et temporaires')
-    $contentLines.Add('Thumbs.db')
-    $contentLines.Add('Desktop.ini')
-    $contentLines.Add('*.tmp')
-    $contentLines.Add('*.temp')
-    $contentLines.Add('*.log')
-    $contentLines.Add('')
-    $contentLines.Add('# Dossiers et fichiers locaux')
-    $contentLines.Add('.vscode/')
-    $contentLines.Add('.idea/')
-    $contentLines.Add('.env')
-    $contentLines.Add('.env.*')
-
-    if ($ProjectType -eq 'py') {
-        $contentLines.Add('')
-        $contentLines.Add('# Python')
-        $contentLines.Add('.venv/')
-        $contentLines.Add('__pycache__/')
-        $contentLines.Add('*.pyc')
-        $contentLines.Add('*.pyo')
-        $contentLines.Add('*.pyd')
-        $contentLines.Add('.pytest_cache/')
-        $contentLines.Add('.mypy_cache/')
-        $contentLines.Add('.ruff_cache/')
-        $contentLines.Add('build/')
-        $contentLines.Add('dist/')
-        $contentLines.Add('*.egg-info/')
-    }
-
-    $content = (($contentLines.ToArray()) -join [Environment]::NewLine) + [Environment]::NewLine
+    $content = Get-ProjectGitIgnoreContent -ProjectType $ProjectType
     Write-Utf8TextFile -Path $gitIgnorePath -Content $content
     Write-Host ".gitignore créé : $gitIgnorePath" -ForegroundColor Green
     return $gitIgnorePath
 }
 
-function New-PythonProjectCmdVenvLauncher {
+function Get-PythonProjectCmdVenvLauncherContent {
     param(
-        [Parameter(Mandatory = $true)]
-        [string] $ProjectPath,
-
         [Parameter(Mandatory = $true)]
         [string] $ProjectName
     )
-
-    $launcherPath = Join-Path -Path $ProjectPath -ChildPath 'cmdVenv.cmd'
-
-    if (Test-Path -LiteralPath $launcherPath) {
-        Write-Host "cmdVenv.cmd déjà présent : $launcherPath" -ForegroundColor Yellow
-        return $launcherPath
-    }
 
     $promptLabel = Get-PythonVenvPromptLabel -ProjectName $ProjectName
     $contentLines = @(
@@ -1911,7 +4397,26 @@ function New-PythonProjectCmdVenvLauncher {
         'cmd.exe'
     )
 
-    $content = ($contentLines -join [Environment]::NewLine) + [Environment]::NewLine
+    return (($contentLines -join [Environment]::NewLine) + [Environment]::NewLine)
+}
+
+function New-PythonProjectCmdVenvLauncher {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath,
+
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectName
+    )
+
+    $launcherPath = Join-Path -Path $ProjectPath -ChildPath 'cmdVenv.cmd'
+
+    if (Test-Path -LiteralPath $launcherPath) {
+        Write-Host "cmdVenv.cmd déjà présent : $launcherPath" -ForegroundColor Yellow
+        return $launcherPath
+    }
+
+    $content = Get-PythonProjectCmdVenvLauncherContent -ProjectName $ProjectName
     Write-Utf8TextFile -Path $launcherPath -Content $content -WithoutBom
     Write-Host "cmdVenv.cmd créé : $launcherPath" -ForegroundColor Green
     return $launcherPath
@@ -2014,8 +4519,55 @@ function Invoke-ExternalCommandCapture {
     }
 }
 
-function Get-PreferredPythonManagerCommand {
-    foreach ($commandName in @('pymanager', 'py')) {
+function Invoke-ExternalExecutablePassthrough {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ExecutablePath,
+
+        [string[]] $Arguments = @(),
+
+        [string] $StartMessage = ''
+    )
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    $hadNativeCommandPreference = $false
+    $previousNativeCommandPreference = $null
+
+    if (-not [string]::IsNullOrWhiteSpace($StartMessage)) {
+        Write-StepInfo $StartMessage
+    }
+
+    try {
+        $ErrorActionPreference = 'Continue'
+
+        $nativeCommandPreferenceVariable = Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue
+        if ($null -ne $nativeCommandPreferenceVariable) {
+            $hadNativeCommandPreference = $true
+            $previousNativeCommandPreference = [bool] $nativeCommandPreferenceVariable.Value
+            $script:PSNativeCommandUseErrorActionPreference = $false
+        }
+
+        & $ExecutablePath @Arguments
+        $exitCode = if ($null -eq $LASTEXITCODE) { 0 } else { $LASTEXITCODE }
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+
+        if ($hadNativeCommandPreference) {
+            $script:PSNativeCommandUseErrorActionPreference = $previousNativeCommandPreference
+        }
+    }
+
+    return ($exitCode -eq 0)
+}
+
+function Get-PreferredAvailableCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]] $CommandNames
+    )
+
+    foreach ($commandName in $CommandNames) {
         $command = Get-Command -Name $commandName -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($null -ne $command) {
             return [PSCustomObject]@{
@@ -2028,6 +4580,26 @@ function Get-PreferredPythonManagerCommand {
     return $null
 }
 
+function Get-PreferredPythonManagerCommand {
+    return Get-PreferredAvailableCommand -CommandNames @('pymanager', 'py')
+}
+
+function Get-PymanagerCommand {
+    return Get-PreferredAvailableCommand -CommandNames @('pymanager')
+}
+
+function Get-GitHubCliCommand {
+    return Get-PreferredAvailableCommand -CommandNames @('gh')
+}
+
+function Get-WingetCommand {
+    return Get-PreferredAvailableCommand -CommandNames @('winget')
+}
+
+function Get-GitCommand {
+    return Get-PreferredAvailableCommand -CommandNames @('git')
+}
+
 function Invoke-PythonManagerCommandCapture {
     param(
         [string[]] $Arguments = @(),
@@ -2036,6 +4608,72 @@ function Invoke-PythonManagerCommandCapture {
     )
 
     $command = Get-PreferredPythonManagerCommand
+    if ($null -eq $command) {
+        return $null
+    }
+
+    $result = Invoke-ExternalExecutableCapture -ExecutablePath $command.CommandPath -Arguments $Arguments -WaitMessage $WaitMessage
+
+    return [PSCustomObject]@{
+        CommandName = $command.CommandName
+        CommandPath = $result.ExecutablePath
+        Success = $result.Success
+        ExitCode = $result.ExitCode
+        OutputLines = $result.OutputLines
+        ErrorMessage = $result.ErrorMessage
+    }
+}
+
+function Invoke-GitHubCliCommandCapture {
+    param(
+        [string[]] $Arguments = @(),
+
+        [string] $WaitMessage = ''
+    )
+
+    $command = Get-GitHubCliCommand
+    if ($null -eq $command) {
+        return $null
+    }
+
+    $result = Invoke-ExternalExecutableCapture -ExecutablePath $command.CommandPath -Arguments $Arguments -WaitMessage $WaitMessage
+
+    return [PSCustomObject]@{
+        CommandName = $command.CommandName
+        CommandPath = $result.ExecutablePath
+        Success = $result.Success
+        ExitCode = $result.ExitCode
+        OutputLines = $result.OutputLines
+        ErrorMessage = $result.ErrorMessage
+    }
+}
+
+function Invoke-GitHubCliCommandPassthrough {
+    param(
+        [string[]] $Arguments = @(),
+
+        [string] $StartMessage = ''
+    )
+
+    $command = Get-GitHubCliCommand
+    if ($null -eq $command) {
+        return $false
+    }
+
+    return Invoke-ExternalExecutablePassthrough `
+        -ExecutablePath $command.CommandPath `
+        -Arguments $Arguments `
+        -StartMessage $StartMessage
+}
+
+function Invoke-GitCommandCapture {
+    param(
+        [string[]] $Arguments = @(),
+
+        [string] $WaitMessage = ''
+    )
+
+    $command = Get-GitCommand
     if ($null -eq $command) {
         return $null
     }
@@ -2636,7 +5274,32 @@ function Get-CombinedPythonReferenceMatches {
         $combinedMatches.Add($installableMatch)
     }
 
-    return @($combinedMatches.ToArray())
+    return ,@(
+        $combinedMatches.ToArray() |
+            Sort-Object `
+                @{ Expression = {
+                        if ($_.PSObject.Properties.Match('ExecutablePath').Count -gt 0) { 0 } else { 1 }
+                    }
+                }, `
+                @{ Expression = {
+                        if ($_.PSObject.Properties.Match('ExecutablePath').Count -gt 0) {
+                            Get-VersionSortValue -Text "$($_.Version)"
+                        }
+                        else {
+                            Get-VersionSortValue -Text "$($_.Version)"
+                        }
+                    }; Descending = $true
+                }, `
+                @{ Expression = {
+                        if ($_.PSObject.Properties.Match('ExecutablePath').Count -gt 0) {
+                            "$($_.ExecutablePath)".ToLowerInvariant()
+                        }
+                        else {
+                            "$($_.InstallTag)".ToLowerInvariant()
+                        }
+                    }
+                }
+    )
 }
 
 function Get-NormalizedPythonVersionRequest {
@@ -2776,6 +5439,29 @@ function Show-PythonReferenceMatches {
     }
 }
 
+function Resolve-PythonReferenceChoiceForVersionRequest {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]] $Matches
+    )
+
+    $selection = Read-PythonReferenceChoice -Matches $Matches
+
+    if ($selection.Mode -eq 'RetryVersionRequest') {
+        return [PSCustomObject]@{
+            Selection = $null
+            NextVersionRequest = $null
+            ReturnToPreviousStep = $true
+        }
+    }
+
+    return [PSCustomObject]@{
+        Selection = $selection
+        NextVersionRequest = $null
+        ReturnToPreviousStep = $false
+    }
+}
+
 function Read-PythonReferenceChoice {
     param(
         [Parameter(Mandatory = $true)]
@@ -2783,10 +5469,20 @@ function Read-PythonReferenceChoice {
     )
 
     while ($true) {
-        $answer = Read-Host 'Référence Python à utiliser (Entrée = 1, numéro ou chemin Python)'
+        $answer = Read-Host 'Référence Python à utiliser (Entrée = 1, numéro, r = retour ou chemin Python)'
 
         if ([string]::IsNullOrWhiteSpace($answer)) {
             return New-PythonReferenceSelection -Reference $Matches[0]
+        }
+
+        if ($answer.Trim() -match '^(r|retour|back|precedent|précédent)$') {
+            return [PSCustomObject]@{
+                Mode = 'RetryVersionRequest'
+                Interpreter = $null
+                InstallableRuntime = $null
+                PythonExecutablePath = $null
+                VersionRequest = $null
+            }
         }
 
         $selectionIndex = 0
@@ -2803,7 +5499,7 @@ function Read-PythonReferenceChoice {
             }
         }
         catch {
-            Write-Host 'Saisissez un numéro valide ou le chemin complet d''un Python déjà installé.' -ForegroundColor Yellow
+            Write-Host 'Saisissez un numéro valide, r pour revenir ou le chemin complet d''un Python déjà installé.' -ForegroundColor Yellow
         }
     }
 }
@@ -2826,6 +5522,10 @@ function Sync-ProjectPythonInterpreters {
             -DefaultProjectType $ProjectConfig.DefaultProjectType `
             -DefaultCreatePythonVenv $ProjectConfig.DefaultCreatePythonVenv `
             -DefaultPythonInstallLocation $ProjectConfig.DefaultPythonInstallLocation `
+            -AskInstallGitHubCliWhenMissing $ProjectConfig.AskInstallGitHubCliWhenMissing `
+            -AskInstallPythonManagerWhenMissing $ProjectConfig.AskInstallPythonManagerWhenMissing `
+            -DefaultGitHubRepositoryVisibility $ProjectConfig.DefaultGitHubRepositoryVisibility `
+            -GitHubLogin $ProjectConfig.GitHubLogin `
             -PythonDepotPath $ProjectConfig.PythonDepotPath `
             -KnownPythonInterpreters $freshInterpreters `
             -Message 'Catalogue Python synchronisé'
@@ -2891,6 +5591,10 @@ function Add-PythonInterpreterToProjectConfig {
         -DefaultProjectType $ProjectConfig.DefaultProjectType `
         -DefaultCreatePythonVenv $ProjectConfig.DefaultCreatePythonVenv `
         -DefaultPythonInstallLocation $ProjectConfig.DefaultPythonInstallLocation `
+        -AskInstallGitHubCliWhenMissing $ProjectConfig.AskInstallGitHubCliWhenMissing `
+        -AskInstallPythonManagerWhenMissing $ProjectConfig.AskInstallPythonManagerWhenMissing `
+        -DefaultGitHubRepositoryVisibility $ProjectConfig.DefaultGitHubRepositoryVisibility `
+        -GitHubLogin $ProjectConfig.GitHubLogin `
         -PythonDepotPath $ProjectConfig.PythonDepotPath `
         -KnownPythonInterpreters $knownPythonInterpreters.ToArray() `
         -Message 'Python enregistré'
@@ -2969,17 +5673,35 @@ function Show-PythonInstallableLookupFailureMessage {
 function Read-PythonInterpreterSelection {
     param(
         [AllowNull()]
-        [object[]] $KnownPythonInterpreters
+        [object[]] $KnownPythonInterpreters,
+
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $PreferredVersionRequest = $null
     )
 
     $interpreterEntries = @(ConvertTo-CanonicalPythonInterpreterEntries -Entries $KnownPythonInterpreters)
+    $normalizedPreferredVersionRequest = if ([string]::IsNullOrWhiteSpace("$PreferredVersionRequest")) {
+        $null
+    }
+    else {
+        Get-RecommendedPythonVersionRequestFromVersionText -VersionText $PreferredVersionRequest
+    }
 
     if ($interpreterEntries.Count -eq 0) {
         Write-Host 'Aucune version Python connue n''a été trouvée via pymanager ou la configuration.' -ForegroundColor Yellow
     }
 
     while ($true) {
-        $versionPrompt = if ($interpreterEntries.Count -gt 0) {
+        $versionPrompt = if (-not [string]::IsNullOrWhiteSpace("$normalizedPreferredVersionRequest")) {
+            if ($interpreterEntries.Count -gt 0) {
+                "Version Python pour le venv (exemple 3.14, Entrée = $normalizedPreferredVersionRequest recommandé)"
+            }
+            else {
+                "Version Python pour le venv à installer (exemple 3.14, Entrée = $normalizedPreferredVersionRequest recommandé), ou chemin Python"
+            }
+        }
+        elseif ($interpreterEntries.Count -gt 0) {
             'Version Python pour le venv (exemple 3.14, Entrée = versions connues et installables)'
         }
         else {
@@ -2989,38 +5711,51 @@ function Read-PythonInterpreterSelection {
         $versionRequest = Read-Host $versionPrompt
 
         if ([string]::IsNullOrWhiteSpace($versionRequest)) {
-            $installableLookup = Get-PythonInstallableRuntimeEntries -VersionRequest ''
-            $combinedMatches = Get-CombinedPythonReferenceMatches `
-                -KnownMatches $interpreterEntries `
-                -InstallableMatches @($installableLookup.Entries)
-
-            if ($combinedMatches.Count -gt 0) {
-                $title = if ($interpreterEntries.Count -gt 0 -and @($installableLookup.Entries).Count -gt 0) {
-                    'Versions Python connues et installables :'
-                }
-                elseif ($interpreterEntries.Count -gt 0) {
-                    'Versions Python connues :'
-                }
-                else {
-                    'Versions Python installables :'
-                }
-
-                Show-PythonReferenceMatches -Title $title -Matches $combinedMatches
-                return Read-PythonReferenceChoice -Matches $combinedMatches
-            }
-
-            if (-not $installableLookup.LookupAvailable) {
-                Write-Host "La recherche de versions Python installables n'est pas disponible sans 'pymanager' ou 'py'." -ForegroundColor Yellow
-            }
-            elseif ($installableLookup.NoRuntimes) {
-                Write-Host 'Aucune version Python installable n''a été trouvée.' -ForegroundColor Yellow
+            if (-not [string]::IsNullOrWhiteSpace("$normalizedPreferredVersionRequest")) {
+                $versionRequest = $normalizedPreferredVersionRequest
             }
             else {
-                Write-Host 'Impossible de vérifier les versions Python installables.' -ForegroundColor Yellow
-            }
+                $installableLookup = Get-PythonInstallableRuntimeEntries -VersionRequest ''
+                $combinedMatches = Get-CombinedPythonReferenceMatches `
+                    -KnownMatches $interpreterEntries `
+                    -InstallableMatches @($installableLookup.Entries)
 
-            Write-Host 'Saisissez une version Python à installer ou le chemin complet d''un Python déjà installé.' -ForegroundColor Yellow
-            continue
+                if ($combinedMatches.Count -gt 0) {
+                    $title = if ($interpreterEntries.Count -gt 0 -and @($installableLookup.Entries).Count -gt 0) {
+                        'Versions Python connues et installables :'
+                    }
+                    elseif ($interpreterEntries.Count -gt 0) {
+                        'Versions Python connues :'
+                    }
+                    else {
+                        'Versions Python installables :'
+                    }
+
+                    Show-PythonReferenceMatches -Title $title -Matches $combinedMatches
+                    $choiceResolution = Resolve-PythonReferenceChoiceForVersionRequest -Matches $combinedMatches
+                    if ($null -ne $choiceResolution.Selection) {
+                        return $choiceResolution.Selection
+                    }
+
+                    if ($choiceResolution.ReturnToPreviousStep) {
+                        continue
+                    }
+                    continue
+                }
+
+                if (-not $installableLookup.LookupAvailable) {
+                    Write-Host "La recherche de versions Python installables n'est pas disponible sans 'pymanager' ou 'py'." -ForegroundColor Yellow
+                }
+                elseif ($installableLookup.NoRuntimes) {
+                    Write-Host 'Aucune version Python installable n''a été trouvée.' -ForegroundColor Yellow
+                }
+                else {
+                    Write-Host 'Impossible de vérifier les versions Python installables.' -ForegroundColor Yellow
+                }
+
+                Write-Host 'Saisissez une version Python à installer ou le chemin complet d''un Python déjà installé.' -ForegroundColor Yellow
+                continue
+            }
         }
 
         if ($interpreterEntries.Count -eq 0) {
@@ -3044,7 +5779,15 @@ function Read-PythonInterpreterSelection {
 
             if ($matches.ExactMatches.Count -gt 0) {
                 Show-PythonReferenceMatches -Title "Références Python exactes pour '$normalizedVersionRequest' :" -Matches $matches.ExactMatches
-                return Read-PythonReferenceChoice -Matches $matches.ExactMatches
+                $choiceResolution = Resolve-PythonReferenceChoiceForVersionRequest -Matches $matches.ExactMatches
+                if ($null -ne $choiceResolution.Selection) {
+                    return $choiceResolution.Selection
+                }
+
+                if ($choiceResolution.ReturnToPreviousStep) {
+                    continue
+                }
+                continue
             }
 
             $installableLookup = Get-PythonInstallableRuntimeEntries -VersionRequest $normalizedVersionRequest
@@ -3054,7 +5797,15 @@ function Read-PythonInterpreterSelection {
 
             if ($installableMatches.ExactMatches.Count -gt 0) {
                 Show-PythonReferenceMatches -Title "Références Python exactes et installables pour '$normalizedVersionRequest' :" -Matches @($installableMatches.ExactMatches)
-                return Read-PythonReferenceChoice -Matches @($installableMatches.ExactMatches)
+                $choiceResolution = Resolve-PythonReferenceChoiceForVersionRequest -Matches @($installableMatches.ExactMatches)
+                if ($null -ne $choiceResolution.Selection) {
+                    return $choiceResolution.Selection
+                }
+
+                if ($choiceResolution.ReturnToPreviousStep) {
+                    continue
+                }
+                continue
             }
 
             if ($matches.PartialMatches.Count -gt 0) {
@@ -3064,11 +5815,27 @@ function Read-PythonInterpreterSelection {
 
                 if ($combinedMatches.Count -gt $matches.PartialMatches.Count) {
                     Show-PythonReferenceMatches -Title "Références Python compatibles et installables pour '$normalizedVersionRequest' :" -Matches $combinedMatches
-                    return Read-PythonReferenceChoice -Matches $combinedMatches
+                    $choiceResolution = Resolve-PythonReferenceChoiceForVersionRequest -Matches $combinedMatches
+                    if ($null -ne $choiceResolution.Selection) {
+                        return $choiceResolution.Selection
+                    }
+
+                    if ($choiceResolution.ReturnToPreviousStep) {
+                        continue
+                    }
+                    continue
                 }
 
                 Show-PythonReferenceMatches -Title "Références Python compatibles pour '$normalizedVersionRequest' :" -Matches $matches.PartialMatches
-                return Read-PythonReferenceChoice -Matches $matches.PartialMatches
+                $choiceResolution = Resolve-PythonReferenceChoiceForVersionRequest -Matches $matches.PartialMatches
+                if ($null -ne $choiceResolution.Selection) {
+                    return $choiceResolution.Selection
+                }
+
+                if ($choiceResolution.ReturnToPreviousStep) {
+                    continue
+                }
+                continue
             }
         }
 
@@ -3080,7 +5847,15 @@ function Read-PythonInterpreterSelection {
 
         if ($matchingInstallableEntries.Count -gt 0) {
             Show-PythonReferenceMatches -Title "Références Python installables pour '$normalizedVersionRequest' :" -Matches $matchingInstallableEntries
-            return Read-PythonReferenceChoice -Matches $matchingInstallableEntries
+            $choiceResolution = Resolve-PythonReferenceChoiceForVersionRequest -Matches $matchingInstallableEntries
+            if ($null -ne $choiceResolution.Selection) {
+                return $choiceResolution.Selection
+            }
+
+            if ($choiceResolution.ReturnToPreviousStep) {
+                continue
+            }
+            continue
         }
 
         Show-PythonInstallableLookupFailureMessage `
@@ -3278,10 +6053,16 @@ function Select-PythonInterpreterForVenv {
         [string] $ConfigPath,
 
         [Parameter(Mandatory = $true)]
-        [object] $ProjectConfig
+        [object] $ProjectConfig,
+
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $PreferredVersionRequest = $null
     )
 
-    $selection = Read-PythonInterpreterSelection -KnownPythonInterpreters $ProjectConfig.KnownPythonInterpreters
+    $selection = Read-PythonInterpreterSelection `
+        -KnownPythonInterpreters $ProjectConfig.KnownPythonInterpreters `
+        -PreferredVersionRequest $PreferredVersionRequest
 
     if ($selection.Mode -eq 'Known') {
         return [PSCustomObject]@{
@@ -3389,17 +6170,119 @@ $scriptFailure = $null
 Set-Utf8ConsoleEncoding
 
 try {
+    if (-not [string]::IsNullOrWhiteSpace("$PSScriptRoot")) {
+        try {
+            $script:OriginalLocation = Get-Location
+        }
+        catch {
+            $script:OriginalLocation = $null
+        }
+
+        Set-Location -LiteralPath $PSScriptRoot
+    }
+
     $projectConfig = Get-ProjectConfig -ConfigPath $ConfigPath -ConfigFileName $ConfigFileName
     $projectConfig = Ensure-PythonDepotPathConfiguration -ConfigPath $ConfigPath -ProjectConfig $projectConfig
+    $pythonManagerAvailability = Ensure-PythonManagerAvailability -ConfigPath $ConfigPath -ProjectConfig $projectConfig
+    $projectConfig = $pythonManagerAvailability.ProjectConfig
+    $gitHubCliAvailability = Ensure-GitHubCliAvailability -ConfigPath $ConfigPath -ProjectConfig $projectConfig
+    $projectConfig = $gitHubCliAvailability.ProjectConfig
+    $projectConfig = Sync-GitHubLoginConfiguration -ConfigPath $ConfigPath -ProjectConfig $projectConfig
 
     if ([string]::IsNullOrWhiteSpace($ProjectName)) {
         $ProjectName = Read-ProjectName
     }
 
-    $projectTarget = Resolve-ProjectTarget -ProjectsRootPath $projectConfig.ProjectsRootPath -ProjectName $ProjectName
+    $projectWasImportedFromGitHub = $false
+    $projectWillUpdateExistingDirectory = $false
+    $canCreateGitHubRepository = ($null -ne $gitHubCliAvailability.GitHubCliCommand)
+    $projectPath = $null
 
-    if (-not $projectTarget.Cancelled) {
+    while ($true) {
+        $projectTarget = Resolve-ProjectTarget -ProjectsRootPath $projectConfig.ProjectsRootPath -ProjectName $ProjectName
+
+        if ($projectTarget.Cancelled) {
+            break
+        }
+
         $ProjectName = $projectTarget.ProjectName
+        $projectPath = $projectTarget.ProjectPath
+        $projectWillUpdateExistingDirectory = [bool] $projectTarget.UseExistingProject
+
+        if ($projectWillUpdateExistingDirectory) {
+            break
+        }
+
+        if (-not $canCreateGitHubRepository) {
+            break
+        }
+
+        if (-not (Ensure-GitHubCliAuthentication)) {
+            $canCreateGitHubRepository = $false
+            break
+        }
+
+        $existingRepositoryInfo = Get-GitHubRepositoryInfoForProjectName -ProjectName $ProjectName
+        if (-not $existingRepositoryInfo.Exists) {
+            break
+        }
+
+        $gitHubExistingRepositoryAction = Read-ExistingGitHubRepositoryAction `
+            -RepositoryFullName $existingRepositoryInfo.RepositoryFullName `
+            -RepositoryUrl $existingRepositoryInfo.RepositoryUrl
+
+        switch ($gitHubExistingRepositoryAction) {
+            'Import' {
+                Import-GitHubRepositoryToProjectPath `
+                    -RepositoryFullName $existingRepositoryInfo.RepositoryFullName `
+                    -ProjectPath $projectPath
+                $projectWasImportedFromGitHub = $true
+                $canCreateGitHubRepository = $false
+                break
+            }
+            'Rename' {
+                $ProjectName = Read-ProjectName
+                continue
+            }
+            'Cancel' {
+                Write-Host 'Aucune modification effectuée.' -ForegroundColor Yellow
+                $projectPath = $null
+                break
+            }
+        }
+
+        if ($projectWasImportedFromGitHub -or $null -eq $projectPath) {
+            break
+        }
+    }
+
+    if ($projectWasImportedFromGitHub -and $null -ne $projectPath) {
+        $importedProjectSetupResult = Initialize-ImportedPythonProjectEnvironment `
+            -ConfigPath $ConfigPath `
+            -ProjectConfig $projectConfig `
+            -ProjectPath $projectPath `
+            -ProjectName $ProjectName
+        $projectConfig = $importedProjectSetupResult.ProjectConfig
+        Sync-ProjectSetupResultToGitHubIfNeeded `
+            -ProjectPath $projectPath `
+            -ProjectSetupResult $importedProjectSetupResult
+    }
+
+    if ($projectWillUpdateExistingDirectory -and $null -ne $projectPath -and -not $projectWasImportedFromGitHub) {
+        $existingProjectUpdateResult = Update-ExistingProjectSetup `
+            -ConfigPath $ConfigPath `
+            -ProjectConfig $projectConfig `
+            -ProjectPath $projectPath `
+            -ProjectName $ProjectName `
+            -ProjectType $ProjectType `
+            -CustomProjectType $CustomProjectType
+        $projectConfig = $existingProjectUpdateResult.ProjectConfig
+        Sync-ProjectSetupResultToGitHubIfNeeded `
+            -ProjectPath $projectPath `
+            -ProjectSetupResult $existingProjectUpdateResult
+    }
+
+    if ($null -ne $projectPath -and -not $projectWasImportedFromGitHub -and -not $projectWillUpdateExistingDirectory) {
         $projectTypeSelection = Resolve-ProjectTypeSelection `
             -ProjectType $ProjectType `
             -DefaultProjectType $projectConfig.DefaultProjectType `
@@ -3417,6 +6300,7 @@ try {
 
         if ($ProjectType -eq 'py') {
             $createPythonVenv = $false
+            $selectedPythonVersionRequest = $null
             $createPythonVenv = Read-CreatePythonVenv -DefaultCreatePythonVenv $projectConfig.DefaultCreatePythonVenv
 
             if ($createPythonVenv) {
@@ -3424,6 +6308,7 @@ try {
                 $projectConfig = Sync-ProjectPythonInterpreters -ConfigPath $ConfigPath -ProjectConfig $projectConfig
                 $pythonSelection = Select-PythonInterpreterForVenv -ConfigPath $ConfigPath -ProjectConfig $projectConfig
                 $projectConfig = $pythonSelection.ProjectConfig
+                $selectedPythonVersionRequest = Get-RecommendedPythonVersionRequestFromVersionText -VersionText $pythonSelection.Interpreter.Version
                 New-PythonVirtualEnvironment -ProjectPath $projectPath -PythonInterpreter $pythonSelection.Interpreter | Out-Null
             }
 
@@ -3434,12 +6319,30 @@ try {
 
             New-PythonProjectPyprojectFile `
                 -ProjectPath $projectPath `
-                -ProjectName $ProjectName | Out-Null
+                -ProjectName $ProjectName `
+                -RecommendedPythonVersionRequest $selectedPythonVersionRequest | Out-Null
 
             New-PythonProjectRequirementsFile -ProjectPath $projectPath | Out-Null
             New-PythonProjectCmdVenvLauncher `
                 -ProjectPath $projectPath `
                 -ProjectName $ProjectName | Out-Null
+        }
+
+        if ($canCreateGitHubRepository) {
+            $gitHubRepositoryVisibility = Read-GitHubRepositoryVisibilityChoice `
+                -DefaultGitHubRepositoryVisibility $projectConfig.DefaultGitHubRepositoryVisibility
+
+            if ($gitHubRepositoryVisibility -ne 'skip') {
+                try {
+                    New-GitHubRepositoryForProject `
+                        -ProjectPath $projectPath `
+                        -ProjectName $ProjectName `
+                        -Visibility $gitHubRepositoryVisibility
+                }
+                catch {
+                    Write-Host "Création GitHub ignorée : $($_.Exception.Message)" -ForegroundColor Yellow
+                }
+            }
         }
     }
 }
@@ -3448,6 +6351,15 @@ catch {
     Write-Host "Erreur : $($_.Exception.Message)" -ForegroundColor Red
 }
 finally {
+    if ($null -ne $script:OriginalLocation) {
+        try {
+            Set-Location -LiteralPath $script:OriginalLocation.Path
+        }
+        catch {
+            Write-Verbose "Impossible de restaurer le dossier courant : $($_.Exception.Message)"
+        }
+    }
+
     if (-not $NoPause) {
         Read-Host 'Appuyez sur Entrée pour fermer la fenêtre' | Out-Null
     }
