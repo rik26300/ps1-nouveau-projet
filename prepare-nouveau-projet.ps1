@@ -3,13 +3,14 @@ param(
     [string] $ProjectName,
     [string] $ProjectType,
     [string] $CustomProjectType,
+    [switch] $UpdateScript,
     [switch] $NoPause
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = [Version] '1.16.1'
+$ScriptVersion = [Version] '1.17.0'
 $CurrentConfigVersion = 13
 $LegacyConfigVersion = 1
 $ConfigFileName = 'prepare-nouveau-projet.config.json'
@@ -24,6 +25,8 @@ $FallbackAskInstallPythonManagerWhenMissing = $true
 $FallbackGitHubRepositoryVisibility = 'private'
 $FallbackDjangoLanguageCode = 'fr-fr'
 $FallbackDjangoTimeZone = 'Europe/Paris'
+$PublicGitHubRepositoryUrl = 'https://github.com/rik26300/ps1-nouveau-projet'
+$PublicGitHubDefaultBranch = 'main'
 $PythonDepotFolderName = 'Python'
 $ConfigPath = Join-Path -Path $PSScriptRoot -ChildPath $ConfigFileName
 $ReferenceRootPath = Join-Path -Path $PSScriptRoot -ChildPath 'prepare-nouveau-projet'
@@ -126,6 +129,20 @@ function Read-TrimmedHost {
     }
 
     return $answer.Trim()
+}
+
+function Get-UrlEncodedGitHubPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $RelativePath
+    )
+
+    $segments = @($RelativePath -split '[\\/]+')
+    $encodedSegments = foreach ($segment in $segments) {
+        [System.Uri]::EscapeDataString($segment)
+    }
+
+    return ($encodedSegments -join '/')
 }
 
 function Get-TextWithoutDiacritics {
@@ -3592,6 +3609,189 @@ function Get-AutomaticGitCommitMessage {
     }
 }
 
+function Invoke-InternetDownloadToFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Url,
+
+        [Parameter(Mandatory = $true)]
+        [string] $DestinationPath
+    )
+
+    $destinationDirectory = Split-Path -Path $DestinationPath -Parent
+    if (-not [string]::IsNullOrWhiteSpace($destinationDirectory)) {
+        Ensure-DirectoryExists -Path $destinationDirectory | Out-Null
+    }
+
+    Invoke-WebRequest `
+        -Uri $Url `
+        -OutFile $DestinationPath `
+        -UseBasicParsing `
+        -Headers @{ 'User-Agent' = 'prepare-nouveau-projet' } | Out-Null
+}
+
+function Invoke-InternetJsonRequest {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Url
+    )
+
+    $response = Invoke-WebRequest `
+        -Uri $Url `
+        -UseBasicParsing `
+        -Headers @{
+            'User-Agent' = 'prepare-nouveau-projet'
+            'Accept' = 'application/vnd.github+json'
+        }
+
+    if ($null -eq $response -or [string]::IsNullOrWhiteSpace("$($response.Content)")) {
+        throw "Réponse vide reçue depuis '$Url'."
+    }
+
+    return ($response.Content | ConvertFrom-Json -ErrorAction Stop)
+}
+
+function Get-PublicGitHubRepositoryTreePaths {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $RepositoryReference
+    )
+
+    $treeUrl = "https://api.github.com/repos/$($RepositoryReference.Owner)/$($RepositoryReference.Repository)/git/trees/$($RepositoryReference.Branch)?recursive=1"
+    $treeResponse = Invoke-InternetJsonRequest -Url $treeUrl
+    if ($null -eq $treeResponse.tree) {
+        throw "Impossible de lire l'arborescence du dépôt public '$($RepositoryReference.RepositoryUrl)'."
+    }
+
+    return @($treeResponse.tree | Where-Object {
+            $_.type -eq 'blob' -and (
+                $_.path -eq 'prepare-nouveau-projet.ps1' -or
+                $_.path -eq 'prepare-nouveau-projet.cmd' -or
+                $_.path -eq 'prepare-nouveau-projet/NOTICE-UTILISATION.md' -or
+                $_.path -like 'prepare-nouveau-projet/models/*'
+            )
+        } | ForEach-Object { "$($_.path)".Trim() })
+}
+
+function Get-PublicGitHubRawContentUrl {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $RepositoryReference,
+
+        [Parameter(Mandatory = $true)]
+        [string] $RelativePath
+    )
+
+    $encodedPath = Get-UrlEncodedGitHubPath -RelativePath $RelativePath
+    return "https://raw.githubusercontent.com/$($RepositoryReference.Owner)/$($RepositoryReference.Repository)/$($RepositoryReference.Branch)/$encodedPath"
+}
+
+function Sync-ScriptFilesFromPublicGitHub {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ScriptRoot,
+
+        [Parameter(Mandatory = $true)]
+        [object] $RepositoryReference
+    )
+
+    $trackedPaths = @(Get-PublicGitHubRepositoryTreePaths -RepositoryReference $RepositoryReference)
+    if ($trackedPaths.Count -eq 0) {
+        throw "Aucun fichier de mise à jour n'a été trouvé dans le dépôt public '$($RepositoryReference.RepositoryUrl)'."
+    }
+
+    $updatedPaths = [System.Collections.Generic.List[string]]::new()
+    $downloadedMissingModelPaths = [System.Collections.Generic.List[string]]::new()
+
+    $alwaysUpdatedPaths = @(
+        'prepare-nouveau-projet.ps1',
+        'prepare-nouveau-projet.cmd',
+        'prepare-nouveau-projet/NOTICE-UTILISATION.md'
+    )
+
+    foreach ($relativePath in @($trackedPaths)) {
+        $localPath = Join-Path -Path $ScriptRoot -ChildPath ($relativePath -replace '/', '\')
+        $shouldDownload = $alwaysUpdatedPaths -contains $relativePath
+
+        if (-not $shouldDownload -and $relativePath -like 'prepare-nouveau-projet/models/*') {
+            $shouldDownload = -not (Test-Path -LiteralPath $localPath)
+        }
+
+        if (-not $shouldDownload) {
+            continue
+        }
+
+        $downloadUrl = Get-PublicGitHubRawContentUrl -RepositoryReference $RepositoryReference -RelativePath $relativePath
+        $tempFilePath = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ([System.Guid]::NewGuid().ToString() + '.tmp')
+
+        try {
+            Invoke-InternetDownloadToFile -Url $downloadUrl -DestinationPath $tempFilePath
+
+            $destinationDirectory = Split-Path -Path $localPath -Parent
+            if (-not [string]::IsNullOrWhiteSpace($destinationDirectory)) {
+                Ensure-DirectoryExists -Path $destinationDirectory | Out-Null
+            }
+
+            Copy-Item -LiteralPath $tempFilePath -Destination $localPath -Force
+        }
+        finally {
+            if (Test-Path -LiteralPath $tempFilePath) {
+                Remove-Item -LiteralPath $tempFilePath -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        $updatedPaths.Add($localPath)
+        if ($relativePath -like 'prepare-nouveau-projet/models/*' -and -not (Test-Path -LiteralPath $localPath -PathType Leaf)) {
+            continue
+        }
+
+        if ($relativePath -like 'prepare-nouveau-projet/models/*') {
+            $downloadedMissingModelPaths.Add($localPath)
+        }
+    }
+
+    return [PSCustomObject]@{
+        UpdatedPaths = @($updatedPaths.ToArray())
+        DownloadedMissingModelPaths = @($downloadedMissingModelPaths.ToArray())
+    }
+}
+
+function Invoke-ScriptSelfUpdateFromPublicGitHub {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ScriptRoot
+    )
+
+    $allowInternet = Read-ConfirmationWithDefault `
+        -Prompt 'Cette opération va se connecter à Internet pour vérifier le dépôt GitHub public et télécharger les fichiers nécessaires. Continuer ?' `
+        -DefaultValue $false
+
+    if (-not $allowInternet) {
+        Write-Host 'Mise à jour du script annulée.' -ForegroundColor Yellow
+        return
+    }
+
+    $repositoryReference = Get-PublicGitHubRepositoryReference -ProjectPath $ScriptRoot
+    Write-StepInfo "Connexion au dépôt public : $($repositoryReference.RepositoryUrl) (branche : $($repositoryReference.Branch))"
+
+    $syncResult = Sync-ScriptFilesFromPublicGitHub -ScriptRoot $ScriptRoot -RepositoryReference $repositoryReference
+
+    foreach ($updatedPath in @($syncResult.UpdatedPaths)) {
+        if ($updatedPath -like '*\prepare-nouveau-projet\models\*') {
+            Write-Host "Modèle récupéré : $updatedPath" -ForegroundColor Green
+        }
+        else {
+            Write-Host "Fichier mis à jour : $updatedPath" -ForegroundColor Green
+        }
+    }
+
+    if (@($syncResult.DownloadedMissingModelPaths).Count -eq 0) {
+        Write-Host 'Aucun modèle manquant à retélécharger.' -ForegroundColor Yellow
+    }
+
+    Write-Host 'Mise à jour du script terminée. Relancez le script pour utiliser la dernière version.' -ForegroundColor Green
+}
+
 function New-ProjectSetupResult {
     param(
         [Parameter(Mandatory = $true)]
@@ -4000,6 +4200,65 @@ function Test-GitHubOriginRemote {
     }
 
     return ($originRemoteUrl -match '(?i)github\.com[:/]')
+}
+
+function Get-GitHubRepositoryReferenceFromUrl {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $RepositoryUrl,
+
+        [string] $DefaultBranch = $PublicGitHubDefaultBranch
+    )
+
+    $repositoryUrlText = if ($null -eq $RepositoryUrl) { '' } else { $RepositoryUrl.Trim() }
+    if ([string]::IsNullOrWhiteSpace($repositoryUrlText)) {
+        throw 'L''URL du dépôt GitHub ne peut pas être vide.'
+    }
+
+    $match = [System.Text.RegularExpressions.Regex]::Match($repositoryUrlText, '(?i)github\.com[:/](?<owner>[^/:\s]+)/(?<repo>[^/\s]+?)(?:\.git)?/?$')
+    if (-not $match.Success) {
+        throw "Impossible d'analyser l'URL GitHub '$RepositoryUrl'."
+    }
+
+    $owner = $match.Groups['owner'].Value.Trim()
+    $repository = $match.Groups['repo'].Value.Trim()
+    if ([string]::IsNullOrWhiteSpace($owner) -or [string]::IsNullOrWhiteSpace($repository)) {
+        throw "Impossible d'analyser l'URL GitHub '$RepositoryUrl'."
+    }
+
+    return [PSCustomObject]@{
+        Owner = $owner
+        Repository = $repository
+        Branch = $DefaultBranch
+        RepositoryUrl = "https://github.com/$owner/$repository"
+    }
+}
+
+function Get-PublicGitHubRepositoryReference {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath
+    )
+
+    $branchName = Get-GitCurrentBranchName -ProjectPath $ProjectPath
+    if ([string]::IsNullOrWhiteSpace($branchName)) {
+        $branchName = $PublicGitHubDefaultBranch
+    }
+
+    $originRemoteUrl = ''
+    if (Test-Path -LiteralPath (Join-Path -Path $ProjectPath -ChildPath '.git')) {
+        $originRemoteUrl = Get-GitOriginRemoteUrl -ProjectPath $ProjectPath
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($originRemoteUrl) -and $originRemoteUrl -match '(?i)github\.com[:/]') {
+        $reference = Get-GitHubRepositoryReferenceFromUrl -RepositoryUrl $originRemoteUrl -DefaultBranch $branchName
+        $reference | Add-Member -NotePropertyName Source -NotePropertyValue 'origin'
+        return $reference
+    }
+
+    $fallbackReference = Get-GitHubRepositoryReferenceFromUrl -RepositoryUrl $PublicGitHubRepositoryUrl -DefaultBranch $PublicGitHubDefaultBranch
+    $fallbackReference | Add-Member -NotePropertyName Source -NotePropertyValue 'fallback'
+    return $fallbackReference
 }
 
 function Get-ProjectRelativePath {
@@ -7123,6 +7382,11 @@ try {
         }
 
         Set-Location -LiteralPath $PSScriptRoot
+    }
+
+    if ($UpdateScript) {
+        Invoke-ScriptSelfUpdateFromPublicGitHub -ScriptRoot $PSScriptRoot
+        return
     }
 
     $projectConfig = Get-ProjectConfig -ConfigPath $ConfigPath -ConfigFileName $ConfigFileName
