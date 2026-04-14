@@ -1,0 +1,12 @@
+﻿# Fichiers système et temporaires
+Thumbs.db
+Desktop.ini
+*.tmp
+*.temp
+*.log
+
+# Dossiers et fichiers locaux
+.vscode/
+.idea/
+.env
+.env.*
