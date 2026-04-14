@@ -28,10 +28,11 @@ $FallbackDjangoTimeZone = 'Europe/Paris'
 $PublicGitHubRepositoryUrl = 'https://github.com/rik26300/ps1-nouveau-projet'
 $PublicGitHubDefaultBranch = 'main'
 $PythonDepotFolderName = 'Python'
-$ConfigPath = Join-Path -Path $PSScriptRoot -ChildPath $ConfigFileName
 $ReferenceRootPath = Join-Path -Path $PSScriptRoot -ChildPath 'prepare-nouveau-projet'
 $ReferenceModelsPath = Join-Path -Path $ReferenceRootPath -ChildPath 'models'
 $ReferencePythonDepotPath = Join-Path -Path $ReferenceRootPath -ChildPath 'depots python'
+$ConfigPath = Join-Path -Path $ReferenceRootPath -ChildPath $ConfigFileName
+$LegacyConfigPath = Join-Path -Path $PSScriptRoot -ChildPath $ConfigFileName
 $script:OriginalConsoleInputEncoding = $null
 $script:OriginalConsoleOutputEncoding = $null
 $script:OriginalCommandOutputEncoding = $null
@@ -1920,6 +1921,10 @@ function Save-ProjectConfig {
     }
     $normalizedKnownPythonInterpreters = @(ConvertTo-CanonicalPythonInterpreterEntries -Entries $KnownPythonInterpreters)
     Ensure-DirectoryExists -Path $normalizedProjectsRootPath -Label 'Dossier projet'
+    $configDirectoryPath = Split-Path -Path $ConfigPath -Parent
+    if (-not [string]::IsNullOrWhiteSpace($configDirectoryPath)) {
+        Ensure-DirectoryExists -Path $configDirectoryPath -Label 'Dossier de configuration'
+    }
 
     $config = New-ProjectConfigData `
         -ProjectsRootPath $normalizedProjectsRootPath `
@@ -2390,6 +2395,17 @@ function Get-ProjectConfig {
         [Parameter(Mandatory = $true)]
         [string] $ConfigFileName
     )
+
+    $legacyConfigPath = Join-Path -Path $PSScriptRoot -ChildPath $ConfigFileName
+    if ($legacyConfigPath -cne $ConfigPath -and -not (Test-Path -LiteralPath $ConfigPath) -and (Test-Path -LiteralPath $legacyConfigPath)) {
+        $configDirectoryPath = Split-Path -Path $ConfigPath -Parent
+        if (-not [string]::IsNullOrWhiteSpace($configDirectoryPath)) {
+            Ensure-DirectoryExists -Path $configDirectoryPath -Label 'Dossier de configuration'
+        }
+
+        Move-Item -LiteralPath $legacyConfigPath -Destination $ConfigPath -Force
+        Write-Host "Configuration déplacée : $legacyConfigPath -> $ConfigPath" -ForegroundColor Green
+    }
 
     $currentConfig = Use-ExistingProjectConfig -ConfigPath $ConfigPath
 
