@@ -9,7 +9,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = [Version] '1.16.0'
+$ScriptVersion = [Version] '1.16.1'
 $CurrentConfigVersion = 13
 $LegacyConfigVersion = 1
 $ConfigFileName = 'prepare-nouveau-projet.config.json'
@@ -26,6 +26,9 @@ $FallbackDjangoLanguageCode = 'fr-fr'
 $FallbackDjangoTimeZone = 'Europe/Paris'
 $PythonDepotFolderName = 'Python'
 $ConfigPath = Join-Path -Path $PSScriptRoot -ChildPath $ConfigFileName
+$ReferenceRootPath = Join-Path -Path $PSScriptRoot -ChildPath 'prepare-nouveau-projet'
+$ReferenceModelsPath = Join-Path -Path $ReferenceRootPath -ChildPath 'models'
+$ReferencePythonDepotPath = Join-Path -Path $ReferenceRootPath -ChildPath 'depots python'
 $script:OriginalConsoleInputEncoding = $null
 $script:OriginalConsoleOutputEncoding = $null
 $script:OriginalCommandOutputEncoding = $null
@@ -109,6 +112,20 @@ function Write-StepInfo {
     )
 
     Write-Host $Message -ForegroundColor DarkCyan
+}
+
+function Read-TrimmedHost {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Prompt
+    )
+
+    $answer = Read-Host $Prompt
+    if ($null -eq $answer) {
+        return ''
+    }
+
+    return $answer.Trim()
 }
 
 function Get-TextWithoutDiacritics {
@@ -197,6 +214,148 @@ function Test-PythonBasedProjectType {
 
     $normalizedProjectType = if ($null -eq $ProjectType) { '' } else { $ProjectType.Trim().ToLowerInvariant() }
     return ($normalizedProjectType -in @('py', 'django'))
+}
+
+function Get-ProjectTypeModelFolders {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectType
+    )
+
+    $normalizedProjectType = Get-NormalizedProjectType -ProjectType $ProjectType
+
+    switch ($normalizedProjectType) {
+        'django' { return @('python', 'django') }
+        'py' { return @('python') }
+        'ps1' { return @('powershell') }
+        default { return @() }
+    }
+}
+
+function Merge-TemplateContent {
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $BaseContent,
+
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $AdditionalContent
+    )
+
+    $left = if ($null -eq $BaseContent) { '' } else { $BaseContent }
+    $right = if ($null -eq $AdditionalContent) { '' } else { $AdditionalContent }
+
+    if ([string]::IsNullOrWhiteSpace($left)) {
+        return $right
+    }
+
+    if ([string]::IsNullOrWhiteSpace($right)) {
+        return $left
+    }
+
+    return ($left.TrimEnd("`r", "`n") + [Environment]::NewLine + [Environment]::NewLine + $right.TrimStart("`r", "`n"))
+}
+
+function Render-TemplateContent {
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $Content,
+
+        [AllowNull()]
+        [hashtable] $Variables = @{}
+    )
+
+    $renderedContent = if ($null -eq $Content) { '' } else { $Content }
+    foreach ($key in @($Variables.Keys)) {
+        $placeholder = '{{' + $key + '}}'
+        $replacementValue = if ($null -eq $Variables[$key]) { '' } else { [string] $Variables[$key] }
+        $renderedContent = $renderedContent.Replace($placeholder, $replacementValue)
+    }
+
+    return $renderedContent
+}
+
+function Get-ProjectModelContent {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $LogicalFileName,
+
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectType,
+
+        [AllowNull()]
+        [hashtable] $Variables = @{},
+
+        [switch] $OnlySpecificAdditions
+    )
+
+    $content = ''
+    $baseTemplatePath = Join-Path -Path $ReferenceModelsPath -ChildPath $LogicalFileName
+
+    if (-not $OnlySpecificAdditions -and (Test-Path -LiteralPath $baseTemplatePath)) {
+        $content = [System.IO.File]::ReadAllText($baseTemplatePath, [System.Text.Encoding]::UTF8)
+    }
+
+    foreach ($modelFolder in @(Get-ProjectTypeModelFolders -ProjectType $ProjectType)) {
+        if (-not $OnlySpecificAdditions) {
+            $replaceTemplatePath = Join-Path -Path (Join-Path -Path $ReferenceModelsPath -ChildPath $modelFolder) -ChildPath ("remplace_$LogicalFileName")
+            if (Test-Path -LiteralPath $replaceTemplatePath) {
+                $content = [System.IO.File]::ReadAllText($replaceTemplatePath, [System.Text.Encoding]::UTF8)
+            }
+        }
+
+        $addTemplatePath = Join-Path -Path (Join-Path -Path $ReferenceModelsPath -ChildPath $modelFolder) -ChildPath ("ajout_$LogicalFileName")
+        if (Test-Path -LiteralPath $addTemplatePath) {
+            $additionContent = [System.IO.File]::ReadAllText($addTemplatePath, [System.Text.Encoding]::UTF8)
+            $content = Merge-TemplateContent -BaseContent $content -AdditionalContent $additionContent
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($content)) {
+        throw "Aucun modèle exploitable n'a été trouvé pour '$LogicalFileName' (type : $ProjectType)."
+    }
+
+    return Render-TemplateContent -Content $content -Variables $Variables
+}
+
+function Get-ProjectTemplateVariables {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectName,
+
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectType,
+
+        [bool] $HasVirtualEnvironment = $false,
+
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $RecommendedPythonVersionRequest = $null
+    )
+
+    $quickStartLines = [System.Collections.Generic.List[string]]::new()
+    if ($HasVirtualEnvironment) {
+        $quickStartLines.Add('.\.venv\Scripts\Activate.ps1')
+        $quickStartLines.Add('python --version')
+    }
+    else {
+        $quickStartLines.Add('python -m venv .venv')
+        $quickStartLines.Add('.\.venv\Scripts\Activate.ps1')
+        $quickStartLines.Add('python --version')
+    }
+
+    $requiresPythonConstraint = Get-PythonRequiresVersionConstraint -RecommendedVersionRequest $RecommendedPythonVersionRequest
+
+    return @{
+        PROJECT_NAME = $ProjectName
+        PROJECT_TYPE = $ProjectType
+        PYTHON_DISTRIBUTION_NAME = (Get-NormalizedPythonDistributionName -ProjectName $ProjectName)
+        PYTHON_REQUIRES_CONSTRAINT = if ([string]::IsNullOrWhiteSpace("$requiresPythonConstraint")) { '' } else { $requiresPythonConstraint }
+        PYTHON_VENV_COMMANDS = ($quickStartLines -join [Environment]::NewLine)
+        PYTHON_VENV_PROMPT_LABEL = (Get-PythonVenvPromptLabel -ProjectName $ProjectName)
+    }
 }
 
 function Get-NormalizedBooleanSetting {
@@ -538,7 +697,7 @@ function Read-ExistingProjectAction {
     Write-Host '3. Fermer sans rien faire'
 
     while ($true) {
-        $answer = (Read-Host 'Choix (1/2/3)').Trim()
+        $answer = Read-TrimmedHost -Prompt 'Choix (1/2/3)'
 
         switch -Regex ($answer) {
             '^(1|m|maj|mettre-a-jour|mettre à jour|update)$' { return 'Update' }
@@ -620,7 +779,7 @@ function Read-GitHubRepositoryVisibilityChoice {
     Write-Host '3. Ne pas créer de dépôt GitHub'
 
     while ($true) {
-        $answer = (Read-Host "Visibilité du dépôt GitHub (Entrée = $defaultChoiceLabel)").Trim()
+        $answer = Read-TrimmedHost -Prompt "Visibilité du dépôt GitHub (Entrée = $defaultChoiceLabel)"
 
         if ($answer -match '^(3|n|non|skip|ignorer)$') {
             return 'skip'
@@ -704,7 +863,7 @@ function Read-PythonInstallLocationChoice {
     Write-Host '2. Utiliser l''installation par défaut'
 
     while ($true) {
-        $answer = (Read-Host "Choix de l'emplacement d'installation (Entrée = $defaultChoiceLabel)").Trim()
+        $answer = Read-TrimmedHost -Prompt "Choix de l'emplacement d'installation (Entrée = $defaultChoiceLabel)"
 
         try {
             $normalizedInstallLocation = Get-NormalizedPythonInstallLocationSetting `
@@ -743,14 +902,7 @@ function Get-DefaultPythonDepotPath {
         [string] $ProjectsRootPath
     )
 
-    $normalizedProjectsRootPath = Get-NormalizedPath -Path $ProjectsRootPath
-    $parentDirectoryPath = Split-Path -Path $normalizedProjectsRootPath -Parent
-
-    if ([string]::IsNullOrWhiteSpace($parentDirectoryPath)) {
-        throw "Impossible de déterminer le dossier parent du dossier projet '$normalizedProjectsRootPath'."
-    }
-
-    return Join-Path -Path $parentDirectoryPath -ChildPath $PythonDepotFolderName
+    return $ReferencePythonDepotPath
 }
 
 function Read-OptionalPythonDepotPath {
@@ -2664,7 +2816,7 @@ function Read-ExistingGitHubRepositoryAction {
     Write-Host '3. Arrêter sans rien créer'
 
     while ($true) {
-        $answer = (Read-Host 'Choix (1/2/3)').Trim()
+        $answer = Read-TrimmedHost -Prompt 'Choix (1/2/3)'
 
         switch -Regex ($answer) {
             '^(1|i|import|importer)$' { return 'Import' }
@@ -2770,34 +2922,16 @@ function Get-PythonProjectReadmeSupplementContent {
         [Parameter(Mandatory = $true)]
         [string] $ProjectName,
 
-        [bool] $HasVirtualEnvironment = $false
+        [bool] $HasVirtualEnvironment = $false,
+
+        [string] $ProjectType = 'py'
     )
 
-    $quickStartLines = [System.Collections.Generic.List[string]]::new()
-    if ($HasVirtualEnvironment) {
-        $quickStartLines.Add('.\.venv\Scripts\Activate.ps1')
-        $quickStartLines.Add('python --version')
-    }
-    else {
-        $quickStartLines.Add('python -m venv .venv')
-        $quickStartLines.Add('.\.venv\Scripts\Activate.ps1')
-        $quickStartLines.Add('python --version')
-    }
-
-    $contentLines = @(
-        '',
-        '## Préparation locale',
-        '',
-        'Informations ajoutées par `prepare-nouveau-projet.ps1`.',
-        '',
-        '```',
-        ($quickStartLines -join [Environment]::NewLine),
-        '```',
-        '',
-        '- Le venv local est prévu dans le dossier `.venv`.'
-    )
-
-    return (($contentLines -join [Environment]::NewLine) + [Environment]::NewLine)
+    return Get-ProjectModelContent `
+        -LogicalFileName 'README.md' `
+        -ProjectType $ProjectType `
+        -Variables (Get-ProjectTemplateVariables -ProjectName $ProjectName -ProjectType $ProjectType -HasVirtualEnvironment $HasVirtualEnvironment) `
+        -OnlySpecificAdditions
 }
 
 function Get-MissingPythonProjectReadmeMarkers {
@@ -2805,17 +2939,22 @@ function Get-MissingPythonProjectReadmeMarkers {
         [Parameter(Mandatory = $true)]
         [string] $Content,
 
-        [bool] $HasVirtualEnvironment = $false
+        [bool] $HasVirtualEnvironment = $false,
+
+        [string] $ProjectType = 'py'
     )
 
+    $supplementContent = Get-PythonProjectReadmeSupplementContent -ProjectName 'Projet' -HasVirtualEnvironment $HasVirtualEnvironment -ProjectType $ProjectType
     $expectedMarkers = [System.Collections.Generic.List[string]]::new()
-    $expectedMarkers.Add('Informations ajoutées par `prepare-nouveau-projet.ps1`.')
-    $expectedMarkers.Add('## Préparation locale')
-    $expectedMarkers.Add('.\.venv\Scripts\Activate.ps1')
-    $expectedMarkers.Add('- Le venv local est prévu dans le dossier `.venv`.')
+    foreach ($line in @(($supplementContent -replace "`r`n", "`n") -split "`n")) {
+        $trimmedLine = $line.Trim()
+        if ([string]::IsNullOrWhiteSpace($trimmedLine) -or $trimmedLine -eq '```') {
+            continue
+        }
 
-    if (-not $HasVirtualEnvironment) {
-        $expectedMarkers.Add('python -m venv .venv')
+        if ($expectedMarkers -notcontains $trimmedLine) {
+            $expectedMarkers.Add($trimmedLine)
+        }
     }
 
     return @($expectedMarkers | Where-Object { $Content -notmatch [regex]::Escape($_) })
@@ -3120,19 +3259,19 @@ function Get-ImportedPythonProjectSetupPlan {
                 Type = 'WriteFile'
                 Path = $readmePath
                 Description = 'Créer README.md'
-                Content = (Get-PythonProjectReadmeContent -ProjectName $ProjectName -HasVirtualEnvironment $finalHasVirtualEnvironment)
+                Content = (Get-PythonProjectReadmeContent -ProjectName $ProjectName -HasVirtualEnvironment $finalHasVirtualEnvironment -ProjectType $ProjectType)
                 WithoutBom = $false
             })
     }
     else {
         $readmeContent = [System.IO.File]::ReadAllText($readmePath, [System.Text.Encoding]::UTF8)
-        $missingReadmeMarkers = @(Get-MissingPythonProjectReadmeMarkers -Content $readmeContent -HasVirtualEnvironment $finalHasVirtualEnvironment)
+        $missingReadmeMarkers = @(Get-MissingPythonProjectReadmeMarkers -Content $readmeContent -HasVirtualEnvironment $finalHasVirtualEnvironment -ProjectType $ProjectType)
         if ($missingReadmeMarkers.Count -gt 0) {
             $changes.Add([PSCustomObject]@{
                     Type = 'WriteFile'
                     Path = $readmePath
                     Description = 'Compléter README.md'
-                    Content = ($readmeContent.TrimEnd("`r", "`n") + (Get-PythonProjectReadmeSupplementContent -ProjectName $ProjectName -HasVirtualEnvironment $finalHasVirtualEnvironment))
+                    Content = ($readmeContent.TrimEnd("`r", "`n") + (Get-PythonProjectReadmeSupplementContent -ProjectName $ProjectName -HasVirtualEnvironment $finalHasVirtualEnvironment -ProjectType $ProjectType))
                     WithoutBom = $false
                     MissingEntries = $missingReadmeMarkers
                 })
@@ -3145,7 +3284,7 @@ function Get-ImportedPythonProjectSetupPlan {
                 Type = 'WriteFile'
                 Path = $pyprojectPath
                 Description = 'Créer pyproject.toml'
-                Content = (Get-PythonProjectPyprojectContent -ProjectName $ProjectName -RecommendedPythonVersionRequest $RecommendedPythonVersionRequest)
+                Content = (Get-PythonProjectPyprojectContent -ProjectName $ProjectName -RecommendedPythonVersionRequest $RecommendedPythonVersionRequest -ProjectType $ProjectType)
                 WithoutBom = $false
             })
     }
@@ -3173,7 +3312,7 @@ function Get-ImportedPythonProjectSetupPlan {
                 Type = 'WriteFile'
                 Path = $requirementsPath
                 Description = "Créer $(Split-Path -Leaf $requirementsPath)"
-                Content = (Get-PythonProjectRequirementsContent)
+                Content = (Get-PythonProjectRequirementsContent -ProjectType $ProjectType)
                 WithoutBom = $false
             })
     }
@@ -3206,7 +3345,7 @@ function Get-ImportedPythonProjectSetupPlan {
     else {
         $currentGitIgnoreContent = [System.IO.File]::ReadAllText($gitIgnorePath, [System.Text.Encoding]::UTF8)
         $currentGitIgnoreLines = @(($currentGitIgnoreContent -replace "`r`n", "`n") -split "`n")
-        $missingGitIgnoreSections = @(Get-MissingGitIgnoreEntries -CurrentLines $currentGitIgnoreLines -ProjectType 'py')
+        $missingGitIgnoreSections = @(Get-MissingGitIgnoreEntries -CurrentLines $currentGitIgnoreLines -ProjectType $ProjectType)
         if ($missingGitIgnoreSections.Count -gt 0) {
             $missingEntries = @()
             foreach ($section in $missingGitIgnoreSections) {
@@ -3224,7 +3363,7 @@ function Get-ImportedPythonProjectSetupPlan {
 
     if ($finalHasVirtualEnvironment) {
         $cmdVenvPath = Join-Path -Path $ProjectPath -ChildPath 'cmdVenv.cmd'
-        $expectedCmdVenvContent = Get-PythonProjectCmdVenvLauncherContent -ProjectName $ProjectName
+        $expectedCmdVenvContent = Get-PythonProjectCmdVenvLauncherContent -ProjectName $ProjectName -ProjectType $ProjectType
         if (-not (Test-Path -LiteralPath $cmdVenvPath)) {
             $changes.Add([PSCustomObject]@{
                     Type = 'WriteFile'
@@ -3438,6 +3577,19 @@ function ConvertTo-NormalizedPathList {
     }
 
     return @($normalizedPaths.ToArray())
+}
+
+function Get-AutomaticGitCommitMessage {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('project-init', 'project-update')]
+        [string] $CommitType
+    )
+
+    switch ($CommitType) {
+        'project-init' { return 'Initialisation du projet / Project initialization' }
+        'project-update' { return 'Mise à jour du projet via prepare-nouveau-projet.ps1 / Project update via prepare-nouveau-projet.ps1' }
+    }
 }
 
 function New-ProjectSetupResult {
@@ -3730,7 +3882,7 @@ function Ensure-LocalGitRepositoryReady {
         throw "Impossible d'ajouter les fichiers du projet au dépôt Git local."
     }
 
-    $commitResult = Invoke-GitCommandCapture -Arguments @('-C', $ProjectPath, 'commit', '-m', 'Initialisation du projet')
+    $commitResult = Invoke-GitCommandCapture -Arguments @('-C', $ProjectPath, 'commit', '-m', (Get-AutomaticGitCommitMessage -CommitType 'project-init'))
     foreach ($outputLine in $commitResult.OutputLines) {
         if (-not [string]::IsNullOrWhiteSpace("$outputLine")) {
             Write-Host $outputLine
@@ -3995,7 +4147,7 @@ function Sync-UpdatedProjectToGitHub {
         return
     }
 
-    $commitResult = Invoke-GitCommandCapture -Arguments @('-C', $ProjectPath, 'commit', '-m', 'Mise à jour du projet via prepare-nouveau-projet.ps1') -WaitMessage 'Création du commit Git de mise à jour'
+    $commitResult = Invoke-GitCommandCapture -Arguments @('-C', $ProjectPath, 'commit', '-m', (Get-AutomaticGitCommitMessage -CommitType 'project-update')) -WaitMessage 'Création du commit Git de mise à jour'
     foreach ($outputLine in @($commitResult.OutputLines)) {
         if (-not [string]::IsNullOrWhiteSpace("$outputLine")) {
             Write-Host $outputLine
@@ -4345,48 +4497,15 @@ function Get-PythonProjectReadmeContent {
         [Parameter(Mandatory = $true)]
         [string] $ProjectName,
 
-        [bool] $HasVirtualEnvironment = $false
+        [bool] $HasVirtualEnvironment = $false,
+
+        [string] $ProjectType = 'py'
     )
 
-    $quickStartLines = [System.Collections.Generic.List[string]]::new()
-
-    if ($HasVirtualEnvironment) {
-        $quickStartLines.Add('.\.venv\Scripts\Activate.ps1')
-        $quickStartLines.Add('python --version')
-    }
-    else {
-        $quickStartLines.Add('python -m venv .venv')
-        $quickStartLines.Add('.\.venv\Scripts\Activate.ps1')
-        $quickStartLines.Add('python --version')
-    }
-
-    $contentLines = @(
-        "# $ProjectName",
-        '',
-        'Projet Python préparé avec `prepare-nouveau-projet.ps1`.',
-        '',
-        '## Démarrage rapide',
-        '',
-        '```',
-        ($quickStartLines -join [Environment]::NewLine),
-        '```',
-        ''
-    )
-
-    $supplementContent = Get-PythonProjectReadmeSupplementContent -ProjectName $ProjectName -HasVirtualEnvironment $HasVirtualEnvironment
-    $supplementLines = @(($supplementContent -replace "`r`n", "`n").TrimEnd("`n").Split("`n"))
-    foreach ($supplementLine in $supplementLines) {
-        $contentLines += $supplementLine
-    }
-
-    $contentLines += @(
-        '',
-        '## Notes',
-        '',
-        '- Le code du projet peut être ajouté ici.'
-    )
-
-    return (($contentLines -join [Environment]::NewLine) + [Environment]::NewLine)
+    return Get-ProjectModelContent `
+        -LogicalFileName 'README.md' `
+        -ProjectType $ProjectType `
+        -Variables (Get-ProjectTemplateVariables -ProjectName $ProjectName -ProjectType $ProjectType -HasVirtualEnvironment $HasVirtualEnvironment)
 }
 
 function New-PythonProjectReadme {
@@ -4397,7 +4516,9 @@ function New-PythonProjectReadme {
         [Parameter(Mandatory = $true)]
         [string] $ProjectName,
 
-        [bool] $HasVirtualEnvironment = $false
+        [bool] $HasVirtualEnvironment = $false,
+
+        [string] $ProjectType = 'py'
     )
 
     $readmePath = Join-Path -Path $ProjectPath -ChildPath 'README.md'
@@ -4407,20 +4528,21 @@ function New-PythonProjectReadme {
         return $readmePath
     }
 
-    $content = Get-PythonProjectReadmeContent -ProjectName $ProjectName -HasVirtualEnvironment $HasVirtualEnvironment
+    $content = Get-PythonProjectReadmeContent -ProjectName $ProjectName -HasVirtualEnvironment $HasVirtualEnvironment -ProjectType $ProjectType
     Write-Utf8TextFile -Path $readmePath -Content $content
     Write-Host "README créé : $readmePath" -ForegroundColor Green
     return $readmePath
 }
 
 function Get-PythonProjectRequirementsContent {
-    $contentLines = @(
-        '# Dépendances Python du projet',
-        '# Ajoutez une dépendance par ligne, par exemple :',
-        '# requests==2.32.3'
+    param(
+        [string] $ProjectType = 'py'
     )
 
-    return (($contentLines -join [Environment]::NewLine) + [Environment]::NewLine)
+    return Get-ProjectModelContent `
+        -LogicalFileName 'requirements.txt' `
+        -ProjectType $ProjectType `
+        -Variables @{}
 }
 
 function Get-ProjectAgentsContent {
@@ -4429,88 +4551,10 @@ function Get-ProjectAgentsContent {
         [string] $ProjectType
     )
 
-    $normalizedProjectType = Get-NormalizedProjectType -ProjectType $ProjectType
-    $contentLines = [System.Collections.Generic.List[string]]::new()
-
-    $contentLines.Add('# AGENTS.md')
-    $contentLines.Add('')
-    $contentLines.Add('## Objectif')
-    $contentLines.Add("Ce projet est maintenu avec l'aide de Codex.")
-    $contentLines.Add("L'agent doit privilégier les modifications cohérentes, lisibles, réutilisables et compatibles avec l'existant.")
-    $contentLines.Add('')
-    $contentLines.Add('## Règles générales')
-    $contentLines.Add('- Toujours privilégier la réutilisation du code existant.')
-    $contentLines.Add('- Si plusieurs actions sont très similaires, créer une fonction commune, un composant commun ou une structure commune.')
-    $contentLines.Add('- Ne pas dupliquer inutilement la logique métier.')
-    $contentLines.Add('- Préférer les solutions simples, lisibles et maintenables.')
-    $contentLines.Add('- En cas de doute, conserver le comportement existant plutôt que réinventer la structure du projet.')
-    $contentLines.Add('')
-    $contentLines.Add('## Encodage')
-    $contentLines.Add('- Toujours utiliser UTF-8 adapté au français.')
-    $contentLines.Add("- Vérifier systématiquement qu'aucun mojibake n'a été introduit.")
-    $contentLines.Add("- Ne jamais corriger un problème d'accents en repassant un fichier en ASCII.")
-    $contentLines.Add('- Les fichiers texte, scripts, notices et configurations doivent rester lisibles avec les accents français.')
-    $contentLines.Add('')
-    $contentLines.Add('## Modifications de fichiers')
-    $contentLines.Add('- Avant de modifier un fichier existant, comprendre sa logique actuelle.')
-    $contentLines.Add('- Respecter le style déjà en place dans le projet.')
-    $contentLines.Add('- Ne pas faire de refonte large si une correction ciblée suffit.')
-    $contentLines.Add("- Lorsqu'un nouveau comportement ressemble à un comportement existant, s'appuyer dessus au lieu de recréer une autre variante.")
-    $contentLines.Add("- Toute création de fichier doit être cohérente avec la structure actuelle du projet.")
-    $contentLines.Add('')
-    $contentLines.Add('## Git et dépôt')
-    $contentLines.Add('- Ne jamais faire de commande destructive sans demande explicite.')
-    $contentLines.Add("- Ne pas supprimer ou réinitialiser des modifications utilisateur sans autorisation claire.")
-    $contentLines.Add("- Si des fichiers sont ignorés par Git, ne pas bloquer toute la chaîne de commit pour autant.")
-    $contentLines.Add('')
-    $contentLines.Add('## Tests et données')
-    $contentLines.Add('- Si des données de test sont créées, elles doivent être supprimées après test.')
-    $contentLines.Add('- Aucun test persistant ne doit laisser de données de test derrière lui.')
-    $contentLines.Add("- Si une base de données est utilisée, nettoyer les données créées pendant les vérifications.")
-    $contentLines.Add("- Ne pas toucher aux données réelles sans nécessité explicite.")
-    $contentLines.Add('')
-    $contentLines.Add('## Documentation')
-    $contentLines.Add("- Si une notice ou un README est généré, il doit être clair, en français, et cohérent avec le comportement réel du projet.")
-    $contentLines.Add("- Ne pas documenter un comportement qui n'existe pas réellement.")
-
-    if ($normalizedProjectType -eq 'ps1') {
-        $contentLines.Add('')
-        $contentLines.Add('## PowerShell')
-        $contentLines.Add('- Préférer des fonctions courtes, explicites et réutilisables.')
-        $contentLines.Add('- Éviter les effets de bord cachés.')
-        $contentLines.Add('- Afficher des messages clairs pour les étapes longues ou importantes.')
-        $contentLines.Add('- Garder les scripts robustes sur Windows PowerShell.')
-        $contentLines.Add('- Faire attention aux chemins Windows avec espaces.')
-        $contentLines.Add('- Si un script crée des fichiers de configuration, gérer la compatibilité ascendante et la migration des anciennes versions.')
-    }
-
-    if (Test-PythonBasedProjectType -ProjectType $normalizedProjectType) {
-        $contentLines.Add('')
-        $contentLines.Add('## Python')
-        $contentLines.Add('- Respecter la structure réelle du projet.')
-        $contentLines.Add('- Préférer des fonctions ou modules simples à comprendre.')
-        $contentLines.Add("- Ne pas ajouter de dépendance Python sans raison valable.")
-        $contentLines.Add("- Si une dépendance est ajoutée, l'inscrire aussi dans le fichier requirements au bon format.")
-        $contentLines.Add('- Si un pyproject.toml est présent, le garder cohérent avec les dépendances réelles.')
-        $contentLines.Add("- Si un venv est utilisé, ne jamais supposer qu'il doit être versionné.")
-        $contentLines.Add('')
-        $contentLines.Add('## Requirements Python')
-        $contentLines.Add('- Les fichiers requirements.txt doivent toujours utiliser le format : "AAAA-MM-JJrequirements.txt".')
-        $contentLines.Add('- AAAA = année sur 4 chiffres, MM = mois sur 2 chiffres, JJ = jour sur 2 chiffres.')
-    }
-
-    if ($normalizedProjectType -eq 'django') {
-        $contentLines.Add('')
-        $contentLines.Add('## Django')
-        $contentLines.Add("- Respecter la structure standard Django quand elle existe déjà.")
-        $contentLines.Add("- Ne pas casser les fichiers générés par Django sans raison valable.")
-        $contentLines.Add("- Lors de modifications automatiques de settings.py, ne changer que les lignes ciblées.")
-        $contentLines.Add('- Préférer des changements localisés et explicites.')
-        $contentLines.Add('- Si un projet Django est détecté, tenir compte de manage.py, settings.py, pyproject.toml et requirements.')
-        $contentLines.Add("- Si une app Django est ajoutée plus tard, penser à la cohérence avec INSTALLED_APPS.")
-    }
-
-    return (($contentLines.ToArray() -join [Environment]::NewLine) + [Environment]::NewLine)
+    return Get-ProjectModelContent `
+        -LogicalFileName 'AGENTS.md' `
+        -ProjectType $ProjectType `
+        -Variables @{}
 }
 
 function New-ProjectAgentsFile {
@@ -4539,6 +4583,8 @@ function New-PythonProjectRequirementsFile {
         [Parameter(Mandatory = $true)]
         [string] $ProjectPath,
 
+        [string] $ProjectType = 'py',
+
         [datetime] $Date = (Get-Date)
     )
 
@@ -4550,7 +4596,7 @@ function New-PythonProjectRequirementsFile {
         return $requirementsPath
     }
 
-    $content = Get-PythonProjectRequirementsContent
+    $content = Get-PythonProjectRequirementsContent -ProjectType $ProjectType
     Write-Utf8TextFile -Path $requirementsPath -Content $content
     Write-Host "Fichier requirements créé : $requirementsPath" -ForegroundColor Green
     return $requirementsPath
@@ -5075,26 +5121,20 @@ function Get-PythonProjectPyprojectContent {
 
         [AllowNull()]
         [AllowEmptyString()]
-        [string] $RecommendedPythonVersionRequest = $null
+        [string] $RecommendedPythonVersionRequest = $null,
+
+        [string] $ProjectType = 'py'
     )
 
-    $distributionName = Get-NormalizedPythonDistributionName -ProjectName $ProjectName
-    $requiresPythonConstraint = Get-PythonRequiresVersionConstraint -RecommendedVersionRequest $RecommendedPythonVersionRequest
-    $contentLines = @(
-        '[project]',
-        "name = ""$distributionName""",
-        'version = "0.1.0"',
-        "description = ""Projet Python $ProjectName""",
-        'readme = "README.md"',
-        $(if (-not [string]::IsNullOrWhiteSpace("$requiresPythonConstraint")) { "requires-python = ""$requiresPythonConstraint""" }),
-        'dependencies = []',
-        '',
-        '[build-system]',
-        'requires = ["setuptools>=61.0"]',
-        'build-backend = "setuptools.build_meta"'
-    ) | Where-Object { $_ -ne $null }
-
-    return (($contentLines -join [Environment]::NewLine) + [Environment]::NewLine)
+    return Get-ProjectModelContent `
+        -LogicalFileName 'pyproject.toml' `
+        -ProjectType $ProjectType `
+        -Variables (Get-ProjectTemplateVariables -ProjectName $ProjectName -ProjectType $ProjectType -RecommendedPythonVersionRequest $RecommendedPythonVersionRequest) `
+        | ForEach-Object {
+            $content = $_
+            $content = [regex]::Replace($content, '(?m)^\s*requires-python\s*=\s*""\s*\r?\n', '')
+            $content
+        }
 }
 
 function New-PythonProjectPyprojectFile {
@@ -5107,7 +5147,9 @@ function New-PythonProjectPyprojectFile {
 
         [AllowNull()]
         [AllowEmptyString()]
-        [string] $RecommendedPythonVersionRequest = $null
+        [string] $RecommendedPythonVersionRequest = $null,
+
+        [string] $ProjectType = 'py'
     )
 
     $pyprojectPath = Join-Path -Path $ProjectPath -ChildPath 'pyproject.toml'
@@ -5119,7 +5161,8 @@ function New-PythonProjectPyprojectFile {
 
     $content = Get-PythonProjectPyprojectContent `
         -ProjectName $ProjectName `
-        -RecommendedPythonVersionRequest $RecommendedPythonVersionRequest
+        -RecommendedPythonVersionRequest $RecommendedPythonVersionRequest `
+        -ProjectType $ProjectType
     Write-Utf8TextFile -Path $pyprojectPath -Content $content
     Write-Host "pyproject.toml créé : $pyprojectPath" -ForegroundColor Green
     return $pyprojectPath
@@ -5131,20 +5174,38 @@ function Get-ProjectGitIgnoreSections {
         [string] $ProjectType
     )
 
+    $gitIgnoreContent = Get-ProjectModelContent -LogicalFileName '.gitignore' -ProjectType $ProjectType -Variables @{}
     $sections = [System.Collections.Generic.List[object]]::new()
-    $sections.Add([PSCustomObject]@{
-            Title = '# Fichiers système et temporaires'
-            Lines = @('Thumbs.db', 'Desktop.ini', '*.tmp', '*.temp', '*.log')
-        })
-    $sections.Add([PSCustomObject]@{
-            Title = '# Dossiers et fichiers locaux'
-            Lines = @('.vscode/', '.idea/', '.env', '.env.*')
-        })
+    $currentSectionTitle = ''
+    $currentSectionLines = [System.Collections.Generic.List[string]]::new()
 
-    if (Test-PythonBasedProjectType -ProjectType $ProjectType) {
+    foreach ($rawLine in @(($gitIgnoreContent -replace "`r`n", "`n") -split "`n")) {
+        $line = $rawLine.TrimEnd()
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            if (-not [string]::IsNullOrWhiteSpace($currentSectionTitle) -or $currentSectionLines.Count -gt 0) {
+                $sections.Add([PSCustomObject]@{
+                        Title = $currentSectionTitle
+                        Lines = @($currentSectionLines.ToArray())
+                    })
+                $currentSectionTitle = ''
+                $currentSectionLines = [System.Collections.Generic.List[string]]::new()
+            }
+
+            continue
+        }
+
+        if ([string]::IsNullOrWhiteSpace($currentSectionTitle)) {
+            $currentSectionTitle = $line
+            continue
+        }
+
+        $currentSectionLines.Add($line)
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($currentSectionTitle) -or $currentSectionLines.Count -gt 0) {
         $sections.Add([PSCustomObject]@{
-                Title = '# Python'
-                Lines = @('.venv/', 'cmdVenv.cmd', '__pycache__/', '*.pyc', '*.pyo', '*.pyd', '.pytest_cache/', '.mypy_cache/', '.ruff_cache/', 'build/', 'dist/', '*.egg-info/')
+                Title = $currentSectionTitle
+                Lines = @($currentSectionLines.ToArray())
             })
     }
 
@@ -5157,22 +5218,7 @@ function Get-ProjectGitIgnoreContent {
         [string] $ProjectType
     )
 
-    $contentLines = [System.Collections.Generic.List[string]]::new()
-    $sections = @(Get-ProjectGitIgnoreSections -ProjectType $ProjectType)
-
-    for ($sectionIndex = 0; $sectionIndex -lt $sections.Count; $sectionIndex++) {
-        $section = $sections[$sectionIndex]
-        if ($sectionIndex -gt 0) {
-            $contentLines.Add('')
-        }
-
-        $contentLines.Add($section.Title)
-        foreach ($line in @($section.Lines)) {
-            $contentLines.Add($line)
-        }
-    }
-
-    return ((($contentLines.ToArray()) -join [Environment]::NewLine) + [Environment]::NewLine)
+    return Get-ProjectModelContent -LogicalFileName '.gitignore' -ProjectType $ProjectType -Variables @{}
 }
 
 function New-ProjectGitIgnoreFile {
@@ -5200,29 +5246,15 @@ function New-ProjectGitIgnoreFile {
 function Get-PythonProjectCmdVenvLauncherContent {
     param(
         [Parameter(Mandatory = $true)]
-        [string] $ProjectName
+        [string] $ProjectName,
+
+        [string] $ProjectType = 'py'
     )
 
-    $promptLabel = Get-PythonVenvPromptLabel -ProjectName $ProjectName
-    $contentLines = @(
-        '@echo off',
-        'setlocal',
-        'chcp 65001 >nul',
-        'cd /d "%~dp0"',
-        '',
-        'if not exist ".venv\Scripts\activate.bat" (',
-        '    echo Erreur : aucun environnement virtuel Python n''a ete trouve dans ".venv".',
-        '    echo Relancez "prepare-nouveau-projet.ps1" ou creez ".venv" manuellement.',
-        '    pause',
-        '    exit /b 1',
-        ')',
-        '',
-        'call ".venv\Scripts\activate.bat"',
-        "set ""PROMPT=($promptLabel) `$P`$G""",
-        'cmd.exe'
-    )
-
-    return (($contentLines -join [Environment]::NewLine) + [Environment]::NewLine)
+    return Get-ProjectModelContent `
+        -LogicalFileName 'cmdVenv.cmd' `
+        -ProjectType $ProjectType `
+        -Variables (Get-ProjectTemplateVariables -ProjectName $ProjectName -ProjectType $ProjectType)
 }
 
 function New-PythonProjectCmdVenvLauncher {
@@ -5232,6 +5264,8 @@ function New-PythonProjectCmdVenvLauncher {
 
         [Parameter(Mandatory = $true)]
         [string] $ProjectName
+        ,
+        [string] $ProjectType = 'py'
     )
 
     $launcherPath = Join-Path -Path $ProjectPath -ChildPath 'cmdVenv.cmd'
@@ -5241,7 +5275,7 @@ function New-PythonProjectCmdVenvLauncher {
         return $launcherPath
     }
 
-    $content = Get-PythonProjectCmdVenvLauncherContent -ProjectName $ProjectName
+    $content = Get-PythonProjectCmdVenvLauncherContent -ProjectName $ProjectName -ProjectType $ProjectType
     Write-Utf8TextFile -Path $launcherPath -Content $content -WithoutBom
     Write-Host "cmdVenv.cmd créé : $launcherPath" -ForegroundColor Green
     return $launcherPath
@@ -7229,17 +7263,20 @@ try {
             New-PythonProjectReadme `
                 -ProjectPath $projectPath `
                 -ProjectName $ProjectName `
-                -HasVirtualEnvironment $createPythonVenv | Out-Null
+                -HasVirtualEnvironment $createPythonVenv `
+                -ProjectType $ProjectType | Out-Null
 
             New-PythonProjectPyprojectFile `
                 -ProjectPath $projectPath `
                 -ProjectName $ProjectName `
-                -RecommendedPythonVersionRequest $selectedPythonVersionRequest | Out-Null
+                -RecommendedPythonVersionRequest $selectedPythonVersionRequest `
+                -ProjectType $ProjectType | Out-Null
 
-            New-PythonProjectRequirementsFile -ProjectPath $projectPath | Out-Null
+            New-PythonProjectRequirementsFile -ProjectPath $projectPath -ProjectType $ProjectType | Out-Null
             New-PythonProjectCmdVenvLauncher `
                 -ProjectPath $projectPath `
-                -ProjectName $ProjectName | Out-Null
+                -ProjectName $ProjectName `
+                -ProjectType $ProjectType | Out-Null
 
             if ($ProjectType -eq 'django') {
                 if ($createPythonVenv) {

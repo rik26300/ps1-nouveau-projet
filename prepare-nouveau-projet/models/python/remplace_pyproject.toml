@@ -1,0 +1,11 @@
+[project]
+name = "{{PYTHON_DISTRIBUTION_NAME}}"
+version = "0.1.0"
+description = "Projet Python {{PROJECT_NAME}}"
+readme = "README.md"
+requires-python = "{{PYTHON_REQUIRES_CONSTRAINT}}"
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"

@@ -47,7 +47,7 @@ Clé modifiée :
 
 ```
 HKEY_CLASSES_ROOT\Applications\powershell.exe\shell\open\command
-"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" "& \"%1\""
+"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -NoExit "& \"%1\""
 ```
 
 Avec ce changement, le chemin du script est bien transmis même s'il contient des espaces.
