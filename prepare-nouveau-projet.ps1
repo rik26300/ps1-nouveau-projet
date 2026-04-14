@@ -3091,6 +3091,8 @@ function Get-ImportedPythonProjectSetupPlan {
         [Parameter(Mandatory = $true)]
         [string] $ProjectName,
 
+        [string] $ProjectType = 'py',
+
         [bool] $WillCreateVirtualEnvironment = $false,
 
         [AllowNull()]
@@ -3100,6 +3102,17 @@ function Get-ImportedPythonProjectSetupPlan {
 
     $finalHasVirtualEnvironment = $WillCreateVirtualEnvironment -or (Test-Path -LiteralPath (Join-Path -Path $ProjectPath -ChildPath '.venv'))
     $changes = [System.Collections.Generic.List[object]]::new()
+    $agentsPath = Join-Path -Path $ProjectPath -ChildPath 'AGENTS.md'
+
+    if (-not (Test-Path -LiteralPath $agentsPath)) {
+        $changes.Add([PSCustomObject]@{
+                Type = 'WriteFile'
+                Path = $agentsPath
+                Description = 'Créer AGENTS.md'
+                Content = (Get-ProjectAgentsContent -ProjectType $ProjectType)
+                WithoutBom = $false
+            })
+    }
 
     $readmePath = Join-Path -Path $ProjectPath -ChildPath 'README.md'
     if (-not (Test-Path -LiteralPath $readmePath)) {
@@ -3516,6 +3529,17 @@ function Update-ExistingProjectSetup {
     $projectTypeToUpdate = $projectTypeSelection.NormalizedProjectType
     $gitIgnorePath = Join-Path -Path $ProjectPath -ChildPath '.gitignore'
     $changes = [System.Collections.Generic.List[object]]::new()
+    $agentsPath = Join-Path -Path $ProjectPath -ChildPath 'AGENTS.md'
+
+    if (-not (Test-Path -LiteralPath $agentsPath)) {
+        $changes.Add([PSCustomObject]@{
+                Type = 'WriteFile'
+                Path = $agentsPath
+                Description = 'Créer AGENTS.md'
+                Content = (Get-ProjectAgentsContent -ProjectType $projectTypeToUpdate)
+                WithoutBom = $false
+            })
+    }
 
     if (-not (Test-Path -LiteralPath $gitIgnorePath)) {
         $changes.Add([PSCustomObject]@{
@@ -3584,6 +3608,7 @@ function Initialize-ImportedPythonProjectEnvironment {
 
     $recommendedPythonVersionInfo = Get-RecommendedPythonVersionInfoFromProjectPath -ProjectPath $ProjectPath
     $recommendedPythonVersionRequest = $recommendedPythonVersionInfo.VersionRequest
+    $detectedPythonProjectType = Get-DetectedExistingProjectType -ProjectPath $ProjectPath
 
     if (-not [string]::IsNullOrWhiteSpace("$recommendedPythonVersionRequest")) {
         if ($recommendedPythonVersionInfo.Source -eq 'venv') {
@@ -3604,6 +3629,7 @@ function Initialize-ImportedPythonProjectEnvironment {
     $setupPlan = Get-ImportedPythonProjectSetupPlan `
         -ProjectPath $ProjectPath `
         -ProjectName $ProjectName `
+        -ProjectType $detectedPythonProjectType `
         -WillCreateVirtualEnvironment $shouldCreatePythonVenv `
         -RecommendedPythonVersionRequest $recommendedPythonVersionRequest
 
@@ -3654,6 +3680,7 @@ function Initialize-ImportedPythonProjectEnvironment {
     $postVenvSetupPlan = Get-ImportedPythonProjectSetupPlan `
         -ProjectPath $ProjectPath `
         -ProjectName $ProjectName `
+        -ProjectType $detectedPythonProjectType `
         -WillCreateVirtualEnvironment $true `
         -RecommendedPythonVersionRequest $selectedPythonVersionRequest
     $postVenvCategorizedChanges = Get-ImportedPythonProjectSetupChangesByCategory -Changes $postVenvSetupPlan.Changes
@@ -4394,6 +4421,117 @@ function Get-PythonProjectRequirementsContent {
     )
 
     return (($contentLines -join [Environment]::NewLine) + [Environment]::NewLine)
+}
+
+function Get-ProjectAgentsContent {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectType
+    )
+
+    $normalizedProjectType = Get-NormalizedProjectType -ProjectType $ProjectType
+    $contentLines = [System.Collections.Generic.List[string]]::new()
+
+    $contentLines.Add('# AGENTS.md')
+    $contentLines.Add('')
+    $contentLines.Add('## Objectif')
+    $contentLines.Add("Ce projet est maintenu avec l'aide de Codex.")
+    $contentLines.Add("L'agent doit privilégier les modifications cohérentes, lisibles, réutilisables et compatibles avec l'existant.")
+    $contentLines.Add('')
+    $contentLines.Add('## Règles générales')
+    $contentLines.Add('- Toujours privilégier la réutilisation du code existant.')
+    $contentLines.Add('- Si plusieurs actions sont très similaires, créer une fonction commune, un composant commun ou une structure commune.')
+    $contentLines.Add('- Ne pas dupliquer inutilement la logique métier.')
+    $contentLines.Add('- Préférer les solutions simples, lisibles et maintenables.')
+    $contentLines.Add('- En cas de doute, conserver le comportement existant plutôt que réinventer la structure du projet.')
+    $contentLines.Add('')
+    $contentLines.Add('## Encodage')
+    $contentLines.Add('- Toujours utiliser UTF-8 adapté au français.')
+    $contentLines.Add("- Vérifier systématiquement qu'aucun mojibake n'a été introduit.")
+    $contentLines.Add("- Ne jamais corriger un problème d'accents en repassant un fichier en ASCII.")
+    $contentLines.Add('- Les fichiers texte, scripts, notices et configurations doivent rester lisibles avec les accents français.')
+    $contentLines.Add('')
+    $contentLines.Add('## Modifications de fichiers')
+    $contentLines.Add('- Avant de modifier un fichier existant, comprendre sa logique actuelle.')
+    $contentLines.Add('- Respecter le style déjà en place dans le projet.')
+    $contentLines.Add('- Ne pas faire de refonte large si une correction ciblée suffit.')
+    $contentLines.Add("- Lorsqu'un nouveau comportement ressemble à un comportement existant, s'appuyer dessus au lieu de recréer une autre variante.")
+    $contentLines.Add("- Toute création de fichier doit être cohérente avec la structure actuelle du projet.")
+    $contentLines.Add('')
+    $contentLines.Add('## Git et dépôt')
+    $contentLines.Add('- Ne jamais faire de commande destructive sans demande explicite.')
+    $contentLines.Add("- Ne pas supprimer ou réinitialiser des modifications utilisateur sans autorisation claire.")
+    $contentLines.Add("- Si des fichiers sont ignorés par Git, ne pas bloquer toute la chaîne de commit pour autant.")
+    $contentLines.Add('')
+    $contentLines.Add('## Tests et données')
+    $contentLines.Add('- Si des données de test sont créées, elles doivent être supprimées après test.')
+    $contentLines.Add('- Aucun test persistant ne doit laisser de données de test derrière lui.')
+    $contentLines.Add("- Si une base de données est utilisée, nettoyer les données créées pendant les vérifications.")
+    $contentLines.Add("- Ne pas toucher aux données réelles sans nécessité explicite.")
+    $contentLines.Add('')
+    $contentLines.Add('## Documentation')
+    $contentLines.Add("- Si une notice ou un README est généré, il doit être clair, en français, et cohérent avec le comportement réel du projet.")
+    $contentLines.Add("- Ne pas documenter un comportement qui n'existe pas réellement.")
+
+    if ($normalizedProjectType -eq 'ps1') {
+        $contentLines.Add('')
+        $contentLines.Add('## PowerShell')
+        $contentLines.Add('- Préférer des fonctions courtes, explicites et réutilisables.')
+        $contentLines.Add('- Éviter les effets de bord cachés.')
+        $contentLines.Add('- Afficher des messages clairs pour les étapes longues ou importantes.')
+        $contentLines.Add('- Garder les scripts robustes sur Windows PowerShell.')
+        $contentLines.Add('- Faire attention aux chemins Windows avec espaces.')
+        $contentLines.Add('- Si un script crée des fichiers de configuration, gérer la compatibilité ascendante et la migration des anciennes versions.')
+    }
+
+    if (Test-PythonBasedProjectType -ProjectType $normalizedProjectType) {
+        $contentLines.Add('')
+        $contentLines.Add('## Python')
+        $contentLines.Add('- Respecter la structure réelle du projet.')
+        $contentLines.Add('- Préférer des fonctions ou modules simples à comprendre.')
+        $contentLines.Add("- Ne pas ajouter de dépendance Python sans raison valable.")
+        $contentLines.Add("- Si une dépendance est ajoutée, l'inscrire aussi dans le fichier requirements au bon format.")
+        $contentLines.Add('- Si un pyproject.toml est présent, le garder cohérent avec les dépendances réelles.')
+        $contentLines.Add("- Si un venv est utilisé, ne jamais supposer qu'il doit être versionné.")
+        $contentLines.Add('')
+        $contentLines.Add('## Requirements Python')
+        $contentLines.Add('- Les fichiers requirements.txt doivent toujours utiliser le format : "AAAA-MM-JJrequirements.txt".')
+        $contentLines.Add('- AAAA = année sur 4 chiffres, MM = mois sur 2 chiffres, JJ = jour sur 2 chiffres.')
+    }
+
+    if ($normalizedProjectType -eq 'django') {
+        $contentLines.Add('')
+        $contentLines.Add('## Django')
+        $contentLines.Add("- Respecter la structure standard Django quand elle existe déjà.")
+        $contentLines.Add("- Ne pas casser les fichiers générés par Django sans raison valable.")
+        $contentLines.Add("- Lors de modifications automatiques de settings.py, ne changer que les lignes ciblées.")
+        $contentLines.Add('- Préférer des changements localisés et explicites.')
+        $contentLines.Add('- Si un projet Django est détecté, tenir compte de manage.py, settings.py, pyproject.toml et requirements.')
+        $contentLines.Add("- Si une app Django est ajoutée plus tard, penser à la cohérence avec INSTALLED_APPS.")
+    }
+
+    return (($contentLines.ToArray() -join [Environment]::NewLine) + [Environment]::NewLine)
+}
+
+function New-ProjectAgentsFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath,
+
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectType
+    )
+
+    $agentsPath = Join-Path -Path $ProjectPath -ChildPath 'AGENTS.md'
+    if (Test-Path -LiteralPath $agentsPath) {
+        Write-Host "AGENTS.md déjà présent : $agentsPath" -ForegroundColor Yellow
+        return $agentsPath
+    }
+
+    $content = Get-ProjectAgentsContent -ProjectType $ProjectType
+    Write-Utf8TextFile -Path $agentsPath -Content $content
+    Write-Host "AGENTS.md créé : $agentsPath" -ForegroundColor Green
+    return $agentsPath
 }
 
 function New-PythonProjectRequirementsFile {
@@ -7067,6 +7205,9 @@ try {
             -ProjectTypeLabel $projectTypeSelection.ProjectTypeLabel
 
         New-ProjectGitIgnoreFile `
+            -ProjectPath $projectPath `
+            -ProjectType $ProjectType | Out-Null
+        New-ProjectAgentsFile `
             -ProjectPath $projectPath `
             -ProjectType $ProjectType | Out-Null
 
