@@ -9,19 +9,21 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = [Version] '1.14.4'
-$CurrentConfigVersion = 11
+$ScriptVersion = [Version] '1.16.0'
+$CurrentConfigVersion = 13
 $LegacyConfigVersion = 1
 $ConfigFileName = 'prepare-nouveau-projet.config.json'
 $ConfigDisabledSuffix = 'desactive'
-$KnownProjectTypes = @('cmd', 'bat', 'ps1', 'py', 'autre')
+$KnownProjectTypes = @('cmd', 'bat', 'ps1', 'py', 'django', 'autre')
 $KnownProjectTypesDisplay = $KnownProjectTypes -join ', '
-$FallbackProjectType = 'py'
+$FallbackProjectType = 'django'
 $FallbackCreatePythonVenv = $true
 $FallbackPythonInstallLocation = 'depot'
 $FallbackAskInstallGitHubCliWhenMissing = $true
 $FallbackAskInstallPythonManagerWhenMissing = $true
 $FallbackGitHubRepositoryVisibility = 'private'
+$FallbackDjangoLanguageCode = 'fr-fr'
+$FallbackDjangoTimeZone = 'Europe/Paris'
 $PythonDepotFolderName = 'Python'
 $ConfigPath = Join-Path -Path $PSScriptRoot -ChildPath $ConfigFileName
 $script:OriginalConsoleInputEncoding = $null
@@ -186,6 +188,17 @@ function Get-NormalizedCustomProjectType {
     return $normalizedCustomProjectType
 }
 
+function Test-PythonBasedProjectType {
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $ProjectType
+    )
+
+    $normalizedProjectType = if ($null -eq $ProjectType) { '' } else { $ProjectType.Trim().ToLowerInvariant() }
+    return ($normalizedProjectType -in @('py', 'django'))
+}
+
 function Get-NormalizedBooleanSetting {
     param(
         [AllowNull()]
@@ -269,6 +282,52 @@ function Get-NormalizedGitHubRepositoryVisibilitySetting {
             throw "La visibilité GitHub '$Visibility' est invalide."
         }
     }
+}
+
+function Get-NormalizedDjangoLanguageCodeSetting {
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $LanguageCode,
+
+        [string] $DefaultLanguageCode = $FallbackDjangoLanguageCode
+    )
+
+    $normalizedLanguageCode = if ([string]::IsNullOrWhiteSpace($LanguageCode)) {
+        $DefaultLanguageCode
+    }
+    else {
+        $LanguageCode.Trim().ToLowerInvariant()
+    }
+
+    if ([string]::IsNullOrWhiteSpace($normalizedLanguageCode)) {
+        throw 'Le paramètre DefaultDjangoLanguageCode ne peut pas être vide.'
+    }
+
+    return $normalizedLanguageCode
+}
+
+function Get-NormalizedDjangoTimeZoneSetting {
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $TimeZone,
+
+        [string] $DefaultTimeZone = $FallbackDjangoTimeZone
+    )
+
+    $normalizedTimeZone = if ([string]::IsNullOrWhiteSpace($TimeZone)) {
+        $DefaultTimeZone
+    }
+    else {
+        $TimeZone.Trim()
+    }
+
+    if ([string]::IsNullOrWhiteSpace($normalizedTimeZone)) {
+        throw 'Le paramètre DefaultDjangoTimeZone ne peut pas être vide.'
+    }
+
+    return $normalizedTimeZone
 }
 
 function Get-NormalizedPathCandidate {
@@ -394,6 +453,61 @@ function Read-ProjectType {
             Write-Host $_.Exception.Message -ForegroundColor Yellow
         }
     }
+}
+
+function Get-DetectedExistingProjectType {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath
+    )
+
+    if (Test-PythonProjectPath -ProjectPath $ProjectPath) {
+        $managePyPath = Join-Path -Path $ProjectPath -ChildPath 'manage.py'
+        if (Test-Path -LiteralPath $managePyPath) {
+            return 'django'
+        }
+
+        $pyprojectPath = Join-Path -Path $ProjectPath -ChildPath 'pyproject.toml'
+        if (Test-Path -LiteralPath $pyprojectPath) {
+            $pyprojectContent = [System.IO.File]::ReadAllText($pyprojectPath, [System.Text.Encoding]::UTF8)
+            if ($pyprojectContent -match '(?im)^\s*dependencies\s*=\s*\[[\s\S]*"django(?:==[^"]+)?"') {
+                return 'django'
+            }
+        }
+
+        foreach ($requirementsFile in @(Get-PythonProjectDatedRequirementsFiles -ProjectPath $ProjectPath)) {
+            $requirementsContent = [System.IO.File]::ReadAllText($requirementsFile.FullName, [System.Text.Encoding]::UTF8)
+            if ($requirementsContent -match '(?im)^\s*django(?:==[^\s#]+)?\s*$') {
+                return 'django'
+            }
+        }
+
+        return 'py'
+    }
+
+    if ((Get-ChildItem -LiteralPath $ProjectPath -Filter '*.ps1' -File -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+        return 'ps1'
+    }
+
+    if ((Get-ChildItem -LiteralPath $ProjectPath -Filter '*.cmd' -File -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+        return 'cmd'
+    }
+
+    if ((Get-ChildItem -LiteralPath $ProjectPath -Filter '*.bat' -File -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+        return 'bat'
+    }
+
+    return $FallbackProjectType
+}
+
+function Read-ConfirmedDetectedProjectType {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $DetectedProjectType
+    )
+
+    Write-Host "Type de projet détecté pour la mise à jour : $DetectedProjectType" -ForegroundColor Cyan
+    return Read-ProjectType -DefaultProjectType $DetectedProjectType
 }
 
 function Read-CustomProjectType {
@@ -1271,6 +1385,68 @@ function Get-NormalizedGitHubLoginFromConfig {
     return $normalizedGitHubLogin
 }
 
+function Get-NormalizedDefaultDjangoLanguageCodeFromConfig {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $RawConfig,
+
+        [Parameter(Mandatory = $true)]
+        [string] $ConfigPath,
+
+        [AllowNull()]
+        [System.Collections.Generic.List[string]] $SyncReasons = [System.Collections.Generic.List[string]]::new()
+    )
+
+    if (-not (Test-ConfigPropertyExists -Config $RawConfig -PropertyName 'DefaultDjangoLanguageCode')) {
+        $SyncReasons.Add("Le paramètre DefaultDjangoLanguageCode de '$ConfigPath' a été ajouté avec la valeur '$FallbackDjangoLanguageCode'.")
+        return $FallbackDjangoLanguageCode
+    }
+
+    try {
+        $defaultDjangoLanguageCode = Get-NormalizedDjangoLanguageCodeSetting -LanguageCode $RawConfig.DefaultDjangoLanguageCode -DefaultLanguageCode $FallbackDjangoLanguageCode
+        if ("$($RawConfig.DefaultDjangoLanguageCode)".Trim() -cne $defaultDjangoLanguageCode) {
+            $SyncReasons.Add("Le paramètre DefaultDjangoLanguageCode de '$ConfigPath' a été normalisé en '$defaultDjangoLanguageCode'.")
+        }
+
+        return $defaultDjangoLanguageCode
+    }
+    catch {
+        $SyncReasons.Add("Le paramètre DefaultDjangoLanguageCode de '$ConfigPath' est invalide. Il a été remplacé par '$FallbackDjangoLanguageCode'.")
+        return $FallbackDjangoLanguageCode
+    }
+}
+
+function Get-NormalizedDefaultDjangoTimeZoneFromConfig {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $RawConfig,
+
+        [Parameter(Mandatory = $true)]
+        [string] $ConfigPath,
+
+        [AllowNull()]
+        [System.Collections.Generic.List[string]] $SyncReasons = [System.Collections.Generic.List[string]]::new()
+    )
+
+    if (-not (Test-ConfigPropertyExists -Config $RawConfig -PropertyName 'DefaultDjangoTimeZone')) {
+        $SyncReasons.Add("Le paramètre DefaultDjangoTimeZone de '$ConfigPath' a été ajouté avec la valeur '$FallbackDjangoTimeZone'.")
+        return $FallbackDjangoTimeZone
+    }
+
+    try {
+        $defaultDjangoTimeZone = Get-NormalizedDjangoTimeZoneSetting -TimeZone $RawConfig.DefaultDjangoTimeZone -DefaultTimeZone $FallbackDjangoTimeZone
+        if ("$($RawConfig.DefaultDjangoTimeZone)".Trim() -cne $defaultDjangoTimeZone) {
+            $SyncReasons.Add("Le paramètre DefaultDjangoTimeZone de '$ConfigPath' a été normalisé en '$defaultDjangoTimeZone'.")
+        }
+
+        return $defaultDjangoTimeZone
+    }
+    catch {
+        $SyncReasons.Add("Le paramètre DefaultDjangoTimeZone de '$ConfigPath' est invalide. Il a été remplacé par '$FallbackDjangoTimeZone'.")
+        return $FallbackDjangoTimeZone
+    }
+}
+
 function New-ProjectConfigData {
     param(
         [Parameter(Mandatory = $true)]
@@ -1294,6 +1470,12 @@ function New-ProjectConfigData {
         [Parameter(Mandatory = $true)]
         [string] $DefaultGitHubRepositoryVisibility,
 
+        [Parameter(Mandatory = $true)]
+        [string] $DefaultDjangoLanguageCode,
+
+        [Parameter(Mandatory = $true)]
+        [string] $DefaultDjangoTimeZone,
+
         [AllowNull()]
         [AllowEmptyString()]
         [string] $GitHubLogin,
@@ -1316,6 +1498,8 @@ function New-ProjectConfigData {
         AskInstallGitHubCliWhenMissing = $AskInstallGitHubCliWhenMissing
         AskInstallPythonManagerWhenMissing = $AskInstallPythonManagerWhenMissing
         DefaultGitHubRepositoryVisibility = $DefaultGitHubRepositoryVisibility
+        DefaultDjangoLanguageCode = $DefaultDjangoLanguageCode
+        DefaultDjangoTimeZone = $DefaultDjangoTimeZone
         GitHubLogin = $GitHubLogin
         PythonDepotPath = $PythonDepotPath
         KnownPythonInterpreters = @(ConvertTo-CanonicalPythonInterpreterEntries -Entries $KnownPythonInterpreters)
@@ -1430,6 +1614,16 @@ function Get-ProjectConfigText {
             Value = $ConfigData.DefaultGitHubRepositoryVisibility
         },
         [PSCustomObject]@{
+            Name = 'DefaultDjangoLanguageCode'
+            Comments = @('Valeur appliquée à LANGUAGE_CODE dans settings.py pour les nouveaux projets Django.')
+            Value = $ConfigData.DefaultDjangoLanguageCode
+        },
+        [PSCustomObject]@{
+            Name = 'DefaultDjangoTimeZone'
+            Comments = @('Valeur appliquée à TIME_ZONE dans settings.py pour les nouveaux projets Django.')
+            Value = $ConfigData.DefaultDjangoTimeZone
+        },
+        [PSCustomObject]@{
             Name = 'GitHubLogin'
             Comments = @('Login GitHub mémorisé pour détecter un changement de compte gh.')
             Value = $ConfigData.GitHubLogin
@@ -1486,6 +1680,12 @@ function Save-ProjectConfig {
         [Parameter(Mandatory = $true)]
         [string] $DefaultGitHubRepositoryVisibility,
 
+        [Parameter(Mandatory = $true)]
+        [string] $DefaultDjangoLanguageCode,
+
+        [Parameter(Mandatory = $true)]
+        [string] $DefaultDjangoTimeZone,
+
         [AllowNull()]
         [AllowEmptyString()]
         [string] $GitHubLogin = $null,
@@ -1517,6 +1717,12 @@ function Save-ProjectConfig {
         -Visibility $DefaultGitHubRepositoryVisibility `
         -AllowDefault `
         -DefaultVisibility $FallbackGitHubRepositoryVisibility
+    $normalizedDefaultDjangoLanguageCode = Get-NormalizedDjangoLanguageCodeSetting `
+        -LanguageCode $DefaultDjangoLanguageCode `
+        -DefaultLanguageCode $FallbackDjangoLanguageCode
+    $normalizedDefaultDjangoTimeZone = Get-NormalizedDjangoTimeZoneSetting `
+        -TimeZone $DefaultDjangoTimeZone `
+        -DefaultTimeZone $FallbackDjangoTimeZone
     $normalizedGitHubLogin = if ([string]::IsNullOrWhiteSpace("$GitHubLogin")) {
         $null
     }
@@ -1539,6 +1745,8 @@ function Save-ProjectConfig {
         -AskInstallGitHubCliWhenMissing $normalizedAskInstallGitHubCliWhenMissing `
         -AskInstallPythonManagerWhenMissing $normalizedAskInstallPythonManagerWhenMissing `
         -DefaultGitHubRepositoryVisibility $normalizedDefaultGitHubRepositoryVisibility `
+        -DefaultDjangoLanguageCode $normalizedDefaultDjangoLanguageCode `
+        -DefaultDjangoTimeZone $normalizedDefaultDjangoTimeZone `
         -GitHubLogin $normalizedGitHubLogin `
         -PythonDepotPath $normalizedPythonDepotPath `
         -KnownPythonInterpreters $normalizedKnownPythonInterpreters
@@ -1557,6 +1765,8 @@ function Save-ProjectConfig {
         AskInstallGitHubCliWhenMissing = $normalizedAskInstallGitHubCliWhenMissing
         AskInstallPythonManagerWhenMissing = $normalizedAskInstallPythonManagerWhenMissing
         DefaultGitHubRepositoryVisibility = $normalizedDefaultGitHubRepositoryVisibility
+        DefaultDjangoLanguageCode = $normalizedDefaultDjangoLanguageCode
+        DefaultDjangoTimeZone = $normalizedDefaultDjangoTimeZone
         GitHubLogin = $normalizedGitHubLogin
         PythonDepotPath = $normalizedPythonDepotPath
         KnownPythonInterpreters = $normalizedKnownPythonInterpreters
@@ -1643,6 +1853,11 @@ function ConvertTo-NormalizedProjectConfig {
         $syncReasons.Add("Le type de projet par défaut de '$ConfigPath' a été ajouté avec la valeur '$FallbackProjectType'.")
     }
 
+    if ($configVersion -lt 12 -and $defaultProjectType -eq 'py') {
+        $defaultProjectType = $FallbackProjectType
+        $syncReasons.Add("Le type de projet par défaut de '$ConfigPath' a été mis à jour de 'py' vers '$FallbackProjectType'.")
+    }
+
     if (Test-ConfigPropertyExists -Config $RawConfig -PropertyName 'DefaultCreatePythonVenv') {
         try {
             $defaultCreatePythonVenv = Get-NormalizedBooleanSetting -Value $RawConfig.DefaultCreatePythonVenv -SettingName "Le paramètre DefaultCreatePythonVenv de '$ConfigPath'"
@@ -1677,6 +1892,14 @@ function ConvertTo-NormalizedProjectConfig {
         -RawConfig $RawConfig `
         -ConfigPath $ConfigPath `
         -SyncReasons $syncReasons
+    $defaultDjangoLanguageCode = Get-NormalizedDefaultDjangoLanguageCodeFromConfig `
+        -RawConfig $RawConfig `
+        -ConfigPath $ConfigPath `
+        -SyncReasons $syncReasons
+    $defaultDjangoTimeZone = Get-NormalizedDefaultDjangoTimeZoneFromConfig `
+        -RawConfig $RawConfig `
+        -ConfigPath $ConfigPath `
+        -SyncReasons $syncReasons
     $gitHubLogin = Get-NormalizedGitHubLoginFromConfig `
         -RawConfig $RawConfig `
         -ConfigPath $ConfigPath `
@@ -1706,6 +1929,8 @@ function ConvertTo-NormalizedProjectConfig {
         AskInstallGitHubCliWhenMissing = $askInstallGitHubCliWhenMissing
         AskInstallPythonManagerWhenMissing = $askInstallPythonManagerWhenMissing
         DefaultGitHubRepositoryVisibility = $defaultGitHubRepositoryVisibility
+        DefaultDjangoLanguageCode = $defaultDjangoLanguageCode
+        DefaultDjangoTimeZone = $defaultDjangoTimeZone
         GitHubLogin = $gitHubLogin
         PythonDepotPath = $pythonDepotPath
         KnownPythonInterpreters = $knownPythonInterpreters
@@ -1817,6 +2042,8 @@ function Use-ExistingProjectConfig {
                 -AskInstallGitHubCliWhenMissing $configStatus.Config.AskInstallGitHubCliWhenMissing `
                 -AskInstallPythonManagerWhenMissing $configStatus.Config.AskInstallPythonManagerWhenMissing `
                 -DefaultGitHubRepositoryVisibility $configStatus.Config.DefaultGitHubRepositoryVisibility `
+                -DefaultDjangoLanguageCode $configStatus.Config.DefaultDjangoLanguageCode `
+                -DefaultDjangoTimeZone $configStatus.Config.DefaultDjangoTimeZone `
                 -GitHubLogin $configStatus.Config.GitHubLogin `
                 -PythonDepotPath $configStatus.Config.PythonDepotPath `
                 -KnownPythonInterpreters $configStatus.Config.KnownPythonInterpreters `
@@ -1859,6 +2086,12 @@ function Ensure-ConfigCopy {
         [Parameter(Mandatory = $true)]
         [string] $DefaultGitHubRepositoryVisibility,
 
+        [Parameter(Mandatory = $true)]
+        [string] $DefaultDjangoLanguageCode,
+
+        [Parameter(Mandatory = $true)]
+        [string] $DefaultDjangoTimeZone,
+
         [AllowNull()]
         [AllowEmptyString()]
         [string] $GitHubLogin,
@@ -1883,6 +2116,8 @@ function Ensure-ConfigCopy {
         -AskInstallGitHubCliWhenMissing $AskInstallGitHubCliWhenMissing `
         -AskInstallPythonManagerWhenMissing $AskInstallPythonManagerWhenMissing `
         -DefaultGitHubRepositoryVisibility $DefaultGitHubRepositoryVisibility `
+        -DefaultDjangoLanguageCode $DefaultDjangoLanguageCode `
+        -DefaultDjangoTimeZone $DefaultDjangoTimeZone `
         -GitHubLogin $GitHubLogin `
         -PythonDepotPath $PythonDepotPath `
         -KnownPythonInterpreters $KnownPythonInterpreters `
@@ -1916,6 +2151,8 @@ function Initialize-ProjectConfig {
             -AskInstallGitHubCliWhenMissing $FallbackAskInstallGitHubCliWhenMissing `
             -AskInstallPythonManagerWhenMissing $FallbackAskInstallPythonManagerWhenMissing `
             -DefaultGitHubRepositoryVisibility $FallbackGitHubRepositoryVisibility `
+            -DefaultDjangoLanguageCode $FallbackDjangoLanguageCode `
+            -DefaultDjangoTimeZone $FallbackDjangoTimeZone `
             -GitHubLogin $null `
             -PythonDepotPath $null
     }
@@ -1934,6 +2171,8 @@ function Initialize-ProjectConfig {
             -AskInstallGitHubCliWhenMissing $FallbackAskInstallGitHubCliWhenMissing `
             -AskInstallPythonManagerWhenMissing $FallbackAskInstallPythonManagerWhenMissing `
             -DefaultGitHubRepositoryVisibility $FallbackGitHubRepositoryVisibility `
+            -DefaultDjangoLanguageCode $FallbackDjangoLanguageCode `
+            -DefaultDjangoTimeZone $FallbackDjangoTimeZone `
             -GitHubLogin $null `
             -PythonDepotPath $null `
             -Message 'Nouvelle configuration créée'
@@ -1948,6 +2187,8 @@ function Initialize-ProjectConfig {
             -AskInstallGitHubCliWhenMissing $candidateConfig.AskInstallGitHubCliWhenMissing `
             -AskInstallPythonManagerWhenMissing $candidateConfig.AskInstallPythonManagerWhenMissing `
             -DefaultGitHubRepositoryVisibility $candidateConfig.DefaultGitHubRepositoryVisibility `
+            -DefaultDjangoLanguageCode $candidateConfig.DefaultDjangoLanguageCode `
+            -DefaultDjangoTimeZone $candidateConfig.DefaultDjangoTimeZone `
             -GitHubLogin $candidateConfig.GitHubLogin `
             -PythonDepotPath $candidateConfig.PythonDepotPath `
             -KnownPythonInterpreters $candidateConfig.KnownPythonInterpreters `
@@ -2003,6 +2244,8 @@ function Ensure-PythonDepotPathConfiguration {
         -AskInstallGitHubCliWhenMissing $ProjectConfig.AskInstallGitHubCliWhenMissing `
         -AskInstallPythonManagerWhenMissing $ProjectConfig.AskInstallPythonManagerWhenMissing `
         -DefaultGitHubRepositoryVisibility $ProjectConfig.DefaultGitHubRepositoryVisibility `
+        -DefaultDjangoLanguageCode $ProjectConfig.DefaultDjangoLanguageCode `
+        -DefaultDjangoTimeZone $ProjectConfig.DefaultDjangoTimeZone `
         -GitHubLogin $ProjectConfig.GitHubLogin `
         -PythonDepotPath $pythonDepotPath `
         -KnownPythonInterpreters $ProjectConfig.KnownPythonInterpreters `
@@ -2082,6 +2325,8 @@ function Ensure-PythonManagerAvailability {
             -AskInstallGitHubCliWhenMissing $ProjectConfig.AskInstallGitHubCliWhenMissing `
             -AskInstallPythonManagerWhenMissing $false `
             -DefaultGitHubRepositoryVisibility $ProjectConfig.DefaultGitHubRepositoryVisibility `
+            -DefaultDjangoLanguageCode $ProjectConfig.DefaultDjangoLanguageCode `
+            -DefaultDjangoTimeZone $ProjectConfig.DefaultDjangoTimeZone `
             -GitHubLogin $ProjectConfig.GitHubLogin `
             -PythonDepotPath $ProjectConfig.PythonDepotPath `
             -KnownPythonInterpreters $ProjectConfig.KnownPythonInterpreters `
@@ -2179,6 +2424,8 @@ function Ensure-GitHubCliAvailability {
             -AskInstallGitHubCliWhenMissing $false `
             -AskInstallPythonManagerWhenMissing $ProjectConfig.AskInstallPythonManagerWhenMissing `
             -DefaultGitHubRepositoryVisibility $ProjectConfig.DefaultGitHubRepositoryVisibility `
+            -DefaultDjangoLanguageCode $ProjectConfig.DefaultDjangoLanguageCode `
+            -DefaultDjangoTimeZone $ProjectConfig.DefaultDjangoTimeZone `
             -GitHubLogin $ProjectConfig.GitHubLogin `
             -PythonDepotPath $ProjectConfig.PythonDepotPath `
             -KnownPythonInterpreters $ProjectConfig.KnownPythonInterpreters `
@@ -2332,6 +2579,8 @@ function Sync-GitHubLoginConfiguration {
         -AskInstallGitHubCliWhenMissing $ProjectConfig.AskInstallGitHubCliWhenMissing `
         -AskInstallPythonManagerWhenMissing $ProjectConfig.AskInstallPythonManagerWhenMissing `
         -DefaultGitHubRepositoryVisibility $ProjectConfig.DefaultGitHubRepositoryVisibility `
+        -DefaultDjangoLanguageCode $ProjectConfig.DefaultDjangoLanguageCode `
+        -DefaultDjangoTimeZone $ProjectConfig.DefaultDjangoTimeZone `
         -GitHubLogin $currentGitHubLogin `
         -PythonDepotPath $ProjectConfig.PythonDepotPath `
         -KnownPythonInterpreters $ProjectConfig.KnownPythonInterpreters `
@@ -3245,7 +3494,14 @@ function Update-ExistingProjectSetup {
         [string] $CustomProjectType
     )
 
-    if (Test-PythonProjectPath -ProjectPath $ProjectPath) {
+    $resolvedProjectType = if ([string]::IsNullOrWhiteSpace($ProjectType)) {
+        Read-ConfirmedDetectedProjectType -DetectedProjectType (Get-DetectedExistingProjectType -ProjectPath $ProjectPath)
+    }
+    else {
+        Get-NormalizedProjectType -ProjectType $ProjectType
+    }
+
+    if (Test-PythonBasedProjectType -ProjectType $resolvedProjectType -and (Test-PythonProjectPath -ProjectPath $ProjectPath)) {
         return Initialize-ImportedPythonProjectEnvironment `
             -ConfigPath $ConfigPath `
             -ProjectConfig $ProjectConfig `
@@ -3254,7 +3510,7 @@ function Update-ExistingProjectSetup {
     }
 
     $projectTypeSelection = Resolve-ProjectTypeSelection `
-        -ProjectType $ProjectType `
+        -ProjectType $resolvedProjectType `
         -DefaultProjectType $ProjectConfig.DefaultProjectType `
         -CustomProjectType $CustomProjectType
     $projectTypeToUpdate = $projectTypeSelection.NormalizedProjectType
@@ -3999,6 +4255,64 @@ function Get-PythonVenvPromptLabel {
     return "venv$projectLabel"
 }
 
+function Get-NormalizedDjangoProjectName {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectName
+    )
+
+    $distributionName = Get-NormalizedPythonDistributionName -ProjectName $ProjectName
+    $djangoProjectName = $distributionName.Replace('-', '_').Replace('.', '_')
+    $djangoProjectName = [System.Text.RegularExpressions.Regex]::Replace($djangoProjectName, '[^a-zA-Z0-9_]', '_')
+    $djangoProjectName = [System.Text.RegularExpressions.Regex]::Replace($djangoProjectName, '_{2,}', '_').Trim('_')
+
+    if ([string]::IsNullOrWhiteSpace($djangoProjectName)) {
+        return 'mon_projet_django'
+    }
+
+    if ($djangoProjectName -notmatch '^[A-Za-z_]') {
+        $djangoProjectName = "projet_$djangoProjectName"
+    }
+
+    return $djangoProjectName.ToLowerInvariant()
+}
+
+function Test-DjangoProjectNameValidity {
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $ProjectName
+    )
+
+    $normalizedProjectName = if ($null -eq $ProjectName) { '' } else { $ProjectName.Trim() }
+    if ([string]::IsNullOrWhiteSpace($normalizedProjectName)) {
+        return $false
+    }
+
+    return ($normalizedProjectName -match '^[A-Za-z_][A-Za-z0-9_]*$')
+}
+
+function Read-DjangoProjectName {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $DefaultProjectName
+    )
+
+    while ($true) {
+        $projectName = Read-Host "Nom du projet Django interne (Entrée = $DefaultProjectName)"
+        if ([string]::IsNullOrWhiteSpace($projectName)) {
+            return $DefaultProjectName
+        }
+
+        $normalizedProjectName = $projectName.Trim()
+        if (Test-DjangoProjectNameValidity -ProjectName $normalizedProjectName) {
+            return $normalizedProjectName
+        }
+
+        Write-Host 'Le nom du projet Django doit commencer par une lettre ou "_" et ne contenir que des lettres, chiffres ou "_".' -ForegroundColor Yellow
+    }
+}
+
 function Get-PythonProjectReadmeContent {
     param(
         [Parameter(Mandatory = $true)]
@@ -4029,11 +4343,20 @@ function Get-PythonProjectReadmeContent {
         '```',
         ($quickStartLines -join [Environment]::NewLine),
         '```',
+        ''
+    )
+
+    $supplementContent = Get-PythonProjectReadmeSupplementContent -ProjectName $ProjectName -HasVirtualEnvironment $HasVirtualEnvironment
+    $supplementLines = @(($supplementContent -replace "`r`n", "`n").TrimEnd("`n").Split("`n"))
+    foreach ($supplementLine in $supplementLines) {
+        $contentLines += $supplementLine
+    }
+
+    $contentLines += @(
         '',
         '## Notes',
         '',
-        '- Le code du projet peut être ajouté ici.',
-        '- Le venv local est prévu dans le dossier `.venv`.'
+        '- Le code du projet peut être ajouté ici.'
     )
 
     return (($contentLines -join [Environment]::NewLine) + [Environment]::NewLine)
@@ -4093,6 +4416,370 @@ function New-PythonProjectRequirementsFile {
     Write-Utf8TextFile -Path $requirementsPath -Content $content
     Write-Host "Fichier requirements créé : $requirementsPath" -ForegroundColor Green
     return $requirementsPath
+}
+
+function Get-LatestPythonProjectRequirementsFilePath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath
+    )
+
+    $datedRequirementsFiles = @(Get-PythonProjectDatedRequirementsFiles -ProjectPath $ProjectPath)
+    if ($datedRequirementsFiles.Count -eq 0) {
+        return New-PythonProjectRequirementsFile -ProjectPath $ProjectPath
+    }
+
+    return ($datedRequirementsFiles | Sort-Object Name -Descending | Select-Object -First 1).FullName
+}
+
+function Update-PythonRequirementsWithPinnedPackage {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath,
+
+        [Parameter(Mandatory = $true)]
+        [string] $PackageName,
+
+        [Parameter(Mandatory = $true)]
+        [string] $Version
+    )
+
+    $requirementsPath = Get-LatestPythonProjectRequirementsFilePath -ProjectPath $ProjectPath
+    $normalizedPackageName = $PackageName.Trim()
+    $normalizedVersion = $Version.Trim()
+    $packagePattern = '(?im)^\s*' + [regex]::Escape($normalizedPackageName) + '\s*==\s*([^\s#]+)\s*$'
+    $expectedLine = "$normalizedPackageName==$normalizedVersion"
+    $content = [System.IO.File]::ReadAllText($requirementsPath, [System.Text.Encoding]::UTF8)
+
+    if ($content -match $packagePattern) {
+        $updatedContent = [regex]::Replace($content, $packagePattern, $expectedLine)
+    }
+    else {
+        $trimmedContent = $content.TrimEnd("`r", "`n")
+        if (-not [string]::IsNullOrWhiteSpace($trimmedContent)) {
+            $updatedContent = $trimmedContent + [Environment]::NewLine + $expectedLine + [Environment]::NewLine
+        }
+        else {
+            $updatedContent = $expectedLine + [Environment]::NewLine
+        }
+    }
+
+    if ($updatedContent -ne $content) {
+        Write-Utf8TextFile -Path $requirementsPath -Content $updatedContent
+        Write-Host "requirements mis à jour : $requirementsPath" -ForegroundColor Green
+    }
+    else {
+        Write-Host "requirements déjà à jour : $requirementsPath" -ForegroundColor Yellow
+    }
+
+    return $requirementsPath
+}
+
+function Update-PythonProjectPyprojectDependencies {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath,
+
+        [Parameter(Mandatory = $true)]
+        [string] $PackageName,
+
+        [Parameter(Mandatory = $true)]
+        [string] $Version
+    )
+
+    $pyprojectPath = Join-Path -Path $ProjectPath -ChildPath 'pyproject.toml'
+    if (-not (Test-Path -LiteralPath $pyprojectPath)) {
+        return $null
+    }
+
+    $normalizedPackageName = $PackageName.Trim()
+    $normalizedVersion = $Version.Trim()
+    $expectedDependency = '"' + $normalizedPackageName + '==' + $normalizedVersion + '"'
+    $content = [System.IO.File]::ReadAllText($pyprojectPath, [System.Text.Encoding]::UTF8)
+    $dependencyArrayMatch = [regex]::Match($content, '(?ms)^\s*dependencies\s*=\s*\[(.*?)\]\s*$')
+    if (-not $dependencyArrayMatch.Success) {
+        return $pyprojectPath
+    }
+
+    $currentBlock = $dependencyArrayMatch.Groups[1].Value
+    if ($currentBlock -match ('(?i)"' + [regex]::Escape($normalizedPackageName) + '==[^"]+"')) {
+        $updatedBlock = [regex]::Replace($currentBlock, '(?i)"' + [regex]::Escape($normalizedPackageName) + '==[^"]+"', $expectedDependency)
+    }
+    elseif ([string]::IsNullOrWhiteSpace($currentBlock.Trim())) {
+        $updatedBlock = $expectedDependency
+    }
+    else {
+        $trimmedBlock = $currentBlock.Trim()
+        $updatedBlock = $trimmedBlock.TrimEnd() + ', ' + $expectedDependency
+    }
+
+    $updatedContent = $content.Substring(0, $dependencyArrayMatch.Groups[1].Index) + $updatedBlock + $content.Substring($dependencyArrayMatch.Groups[1].Index + $dependencyArrayMatch.Groups[1].Length)
+    if ($updatedContent -ne $content) {
+        Write-Utf8TextFile -Path $pyprojectPath -Content $updatedContent
+        Write-Host "pyproject.toml dépendances mises à jour : $pyprojectPath" -ForegroundColor Green
+    }
+    else {
+        Write-Host "pyproject.toml dépendances déjà à jour : $pyprojectPath" -ForegroundColor Yellow
+    }
+
+    return $pyprojectPath
+}
+
+function Get-AvailableDjangoPackageVersions {
+    $packageInfoUrl = 'https://pypi.org/pypi/Django/json'
+
+    try {
+        Write-StepInfo 'Recherche des versions Django téléchargeables...'
+        $response = Invoke-RestMethod -Uri $packageInfoUrl -Method Get -TimeoutSec 20
+    }
+    catch {
+        throw "Impossible de récupérer la liste des versions Django téléchargeables : $($_.Exception.Message)"
+    }
+
+    $versions = [System.Collections.Generic.List[string]]::new()
+    foreach ($releaseProperty in $response.releases.PSObject.Properties) {
+        $versionText = "$($releaseProperty.Name)".Trim()
+        if ($versionText -notmatch '^\d+(?:\.\d+){1,2}$') {
+            continue
+        }
+
+        $releaseFiles = @($releaseProperty.Value)
+        if ($releaseFiles.Count -eq 0) {
+            continue
+        }
+
+        if ($versions -notcontains $versionText) {
+            $versions.Add($versionText)
+        }
+    }
+
+    return @(
+        $versions.ToArray() |
+            Sort-Object -Descending -Property @{ Expression = { Get-VersionSortValue -Text $_ } }
+    )
+}
+
+function Read-DjangoVersionSelection {
+    param(
+        [string[]] $AvailableVersions = @()
+    )
+
+    $versionEntries = @($AvailableVersions | Select-Object -First 15)
+    if ($versionEntries.Count -eq 0) {
+        throw "Aucune version Django téléchargeable n'a été trouvée."
+    }
+
+    Write-Host 'Versions Django téléchargeables :' -ForegroundColor Cyan
+    for ($index = 0; $index -lt $versionEntries.Count; $index++) {
+        $versionText = "$($versionEntries[$index])"
+        $ltsLabel = if ($versionText -match '^\d+\.2(?:\.|$)') { ' [LTS]' } else { '' }
+        Write-Host "$($index + 1). Django $versionText$ltsLabel"
+    }
+
+    while ($true) {
+        $selectionText = Read-Host 'Version Django à installer (Entrée = 1 ou numéro)'
+        if ([string]::IsNullOrWhiteSpace($selectionText)) {
+            return $versionEntries[0]
+        }
+
+        $selectionNumber = 0
+        if ([int]::TryParse($selectionText.Trim(), [ref] $selectionNumber) -and $selectionNumber -ge 1 -and $selectionNumber -le $versionEntries.Count) {
+            return $versionEntries[$selectionNumber - 1]
+        }
+
+        Write-Host "Choix invalide. Saisissez un numéro entre 1 et $($versionEntries.Count)." -ForegroundColor Yellow
+    }
+}
+
+function Install-DjangoInVirtualEnvironment {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath,
+
+        [Parameter(Mandatory = $true)]
+        [string] $DjangoVersion
+    )
+
+    $venvPythonPath = Join-Path -Path $ProjectPath -ChildPath '.venv\Scripts\python.exe'
+    if (-not (Test-Path -LiteralPath $venvPythonPath)) {
+        throw "Le Python du venv est introuvable : $venvPythonPath"
+    }
+
+    Write-Host "Installation de Django $DjangoVersion dans le venv..." -ForegroundColor Cyan
+    Write-Host "Commande exécutée : $venvPythonPath -m pip install Django==$DjangoVersion" -ForegroundColor DarkCyan
+    $installResult = Invoke-ExternalExecutableCapture `
+        -ExecutablePath $venvPythonPath `
+        -Arguments @('-m', 'pip', 'install', "Django==$DjangoVersion") `
+        -WaitMessage "Installation de Django $DjangoVersion en cours"
+
+    foreach ($outputLine in @($installResult.OutputLines)) {
+        if (-not [string]::IsNullOrWhiteSpace("$outputLine")) {
+            Write-Host $outputLine
+        }
+    }
+
+    if (-not $installResult.Success) {
+        if (-not [string]::IsNullOrWhiteSpace($installResult.ErrorMessage)) {
+            throw "Impossible d'installer Django $DjangoVersion dans le venv : $($installResult.ErrorMessage)"
+        }
+
+        throw "Impossible d'installer Django $DjangoVersion dans le venv."
+    }
+
+    Update-PythonRequirementsWithPinnedPackage -ProjectPath $ProjectPath -PackageName 'Django' -Version $DjangoVersion | Out-Null
+    Update-PythonProjectPyprojectDependencies -ProjectPath $ProjectPath -PackageName 'Django' -Version $DjangoVersion | Out-Null
+    Write-Host "Django $DjangoVersion installé dans le venv." -ForegroundColor Green
+}
+
+function New-DjangoProjectStructure {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath,
+
+        [Parameter(Mandatory = $true)]
+        [string] $DjangoProjectName
+    )
+
+    $managePyPath = Join-Path -Path $ProjectPath -ChildPath 'manage.py'
+    $djangoModulePath = Join-Path -Path $ProjectPath -ChildPath $DjangoProjectName
+    if ((Test-Path -LiteralPath $managePyPath) -or (Test-Path -LiteralPath $djangoModulePath)) {
+        Write-Host 'Structure Django déjà présente : startproject ignoré.' -ForegroundColor Yellow
+        return [PSCustomObject]@{
+            Success = $true
+            RequiresAnotherName = $false
+            ErrorMessage = ''
+        }
+    }
+
+    $venvPythonPath = Join-Path -Path $ProjectPath -ChildPath '.venv\Scripts\python.exe'
+    if (-not (Test-Path -LiteralPath $venvPythonPath)) {
+        throw "Le Python du venv est introuvable : $venvPythonPath"
+    }
+
+    Write-Host "Création de la structure Django : $DjangoProjectName" -ForegroundColor Cyan
+    Write-Host "Commande exécutée : $venvPythonPath -m django startproject $DjangoProjectName ." -ForegroundColor DarkCyan
+    $previousLocation = $null
+    try {
+        $previousLocation = Get-Location
+    }
+    catch {
+        $previousLocation = $null
+    }
+
+    try {
+        Set-Location -LiteralPath $ProjectPath
+        $startProjectResult = Invoke-ExternalExecutableCapture `
+            -ExecutablePath $venvPythonPath `
+            -Arguments @('-m', 'django', 'startproject', $DjangoProjectName, '.') `
+            -WaitMessage "Création du projet Django $DjangoProjectName en cours"
+    }
+    finally {
+        if ($null -ne $previousLocation) {
+            Set-Location -LiteralPath $previousLocation.Path
+        }
+    }
+
+    foreach ($outputLine in @($startProjectResult.OutputLines)) {
+        if (-not [string]::IsNullOrWhiteSpace("$outputLine")) {
+            Write-Host $outputLine
+        }
+    }
+
+    if (-not $startProjectResult.Success) {
+        $errorDetails = ''
+        if (-not [string]::IsNullOrWhiteSpace($startProjectResult.ErrorMessage)) {
+            $errorDetails = $startProjectResult.ErrorMessage
+        }
+        else {
+            $errorDetails = (@($startProjectResult.OutputLines) -join ' ').Trim()
+        }
+
+        $requiresAnotherName = ($errorDetails -match '(?i)cannot be used as a project name|conflicts with the name of an existing Python module')
+        return [PSCustomObject]@{
+            Success = $false
+            RequiresAnotherName = $requiresAnotherName
+            ErrorMessage = $errorDetails
+        }
+    }
+
+    Write-Host "Structure Django créée : $ProjectPath" -ForegroundColor Green
+    return [PSCustomObject]@{
+        Success = $true
+        RequiresAnotherName = $false
+        ErrorMessage = ''
+    }
+}
+
+function Ensure-DjangoProjectStructure {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath,
+
+        [Parameter(Mandatory = $true)]
+        [string] $DefaultDjangoProjectName
+    )
+
+    $currentDefaultProjectName = $DefaultDjangoProjectName
+    while ($true) {
+        $selectedDjangoProjectName = Read-DjangoProjectName -DefaultProjectName $currentDefaultProjectName
+        $creationResult = New-DjangoProjectStructure -ProjectPath $ProjectPath -DjangoProjectName $selectedDjangoProjectName
+        if ($creationResult.Success) {
+            return $selectedDjangoProjectName
+        }
+
+        if ($creationResult.RequiresAnotherName) {
+            Write-Host "Le nom Django '$selectedDjangoProjectName' ne peut pas être utilisé ici. Choisissez un autre nom." -ForegroundColor Yellow
+            if (-not [string]::IsNullOrWhiteSpace($creationResult.ErrorMessage)) {
+                Write-Host $creationResult.ErrorMessage -ForegroundColor DarkYellow
+            }
+
+            $currentDefaultProjectName = "${selectedDjangoProjectName}_project"
+            continue
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($creationResult.ErrorMessage)) {
+            throw "Impossible de créer la structure Django '$selectedDjangoProjectName' : $($creationResult.ErrorMessage)"
+        }
+
+        throw "Impossible de créer la structure Django '$selectedDjangoProjectName'."
+    }
+}
+
+function Update-DjangoProjectSettingsFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath,
+
+        [Parameter(Mandatory = $true)]
+        [string] $DjangoProjectName,
+
+        [Parameter(Mandatory = $true)]
+        [string] $LanguageCode,
+
+        [Parameter(Mandatory = $true)]
+        [string] $TimeZone
+    )
+
+    $settingsPath = Join-Path -Path (Join-Path -Path $ProjectPath -ChildPath $DjangoProjectName) -ChildPath 'settings.py'
+    if (-not (Test-Path -LiteralPath $settingsPath)) {
+        Write-Host "settings.py introuvable : $settingsPath" -ForegroundColor Yellow
+        return $null
+    }
+
+    $settingsContent = [System.IO.File]::ReadAllText($settingsPath, [System.Text.Encoding]::UTF8)
+    $updatedSettingsContent = $settingsContent
+    $updatedSettingsContent = [regex]::Replace($updatedSettingsContent, '(?m)^\s*LANGUAGE_CODE\s*=\s*["''][^"'']+["'']\s*$', "LANGUAGE_CODE = '$LanguageCode'")
+    $updatedSettingsContent = [regex]::Replace($updatedSettingsContent, '(?m)^\s*TIME_ZONE\s*=\s*["''][^"'']+["'']\s*$', "TIME_ZONE = '$TimeZone'")
+
+    if ($updatedSettingsContent -ne $settingsContent) {
+        Write-Utf8TextFile -Path $settingsPath -Content $updatedSettingsContent
+        Write-Host "settings.py mis à jour : $settingsPath" -ForegroundColor Green
+    }
+    else {
+        Write-Host "settings.py déjà à jour : $settingsPath" -ForegroundColor Yellow
+    }
+
+    return $settingsPath
 }
 
 function Get-NormalizedGitHubRepositoryName {
@@ -4316,7 +5003,7 @@ function Get-ProjectGitIgnoreSections {
             Lines = @('.vscode/', '.idea/', '.env', '.env.*')
         })
 
-    if ($ProjectType -eq 'py') {
+    if (Test-PythonBasedProjectType -ProjectType $ProjectType) {
         $sections.Add([PSCustomObject]@{
                 Title = '# Python'
                 Lines = @('.venv/', 'cmdVenv.cmd', '__pycache__/', '*.pyc', '*.pyo', '*.pyd', '.pytest_cache/', '.mypy_cache/', '.ruff_cache/', 'build/', 'dist/', '*.egg-info/')
@@ -5142,6 +5829,61 @@ function Get-PythonInstallableRuntimeDisplayLabel {
     return "$version [$installTag, installable via $managerLabel]"
 }
 
+function Get-PythonVersionLabelText {
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $VersionText
+    )
+
+    $normalizedVersionText = if ($null -eq $VersionText) { '' } else { $VersionText.Trim() }
+    if ([string]::IsNullOrWhiteSpace($normalizedVersionText)) {
+        return ''
+    }
+
+    $versionMatch = [System.Text.RegularExpressions.Regex]::Match($normalizedVersionText, '\d+(?:\.\d+)+')
+    if ($versionMatch.Success) {
+        return $versionMatch.Value
+    }
+
+    return $normalizedVersionText
+}
+
+function Get-LatestStablePythonVersionHint {
+    param(
+        [AllowNull()]
+        [object[]] $KnownPythonInterpreters = @(),
+
+        [AllowNull()]
+        [object[]] $InstallableRuntimes = @()
+    )
+
+    $versionCandidates = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($knownInterpreter in @(ConvertTo-CanonicalPythonInterpreterEntries -Entries $KnownPythonInterpreters)) {
+        $versionLabel = Get-PythonVersionLabelText -VersionText "$($knownInterpreter.Version)"
+        if (-not [string]::IsNullOrWhiteSpace($versionLabel) -and $versionCandidates -notcontains $versionLabel) {
+            $versionCandidates.Add($versionLabel)
+        }
+    }
+
+    foreach ($installableRuntime in @(ConvertTo-CanonicalPythonInstallableRuntimeEntries -Entries $InstallableRuntimes)) {
+        $versionLabel = Get-PythonVersionLabelText -VersionText "$($installableRuntime.Version)"
+        if (-not [string]::IsNullOrWhiteSpace($versionLabel) -and $versionCandidates -notcontains $versionLabel) {
+            $versionCandidates.Add($versionLabel)
+        }
+    }
+
+    if ($versionCandidates.Count -eq 0) {
+        return $null
+    }
+
+    return @(
+        $versionCandidates.ToArray() |
+            Sort-Object -Descending -Property @{ Expression = { Get-VersionSortValue -Text $_ } }
+    ) | Select-Object -First 1
+}
+
 function Get-PythonInstallableRuntimeVersionForDepotFolder {
     param(
         [Parameter(Mandatory = $true)]
@@ -5525,6 +6267,8 @@ function Sync-ProjectPythonInterpreters {
             -AskInstallGitHubCliWhenMissing $ProjectConfig.AskInstallGitHubCliWhenMissing `
             -AskInstallPythonManagerWhenMissing $ProjectConfig.AskInstallPythonManagerWhenMissing `
             -DefaultGitHubRepositoryVisibility $ProjectConfig.DefaultGitHubRepositoryVisibility `
+            -DefaultDjangoLanguageCode $ProjectConfig.DefaultDjangoLanguageCode `
+            -DefaultDjangoTimeZone $ProjectConfig.DefaultDjangoTimeZone `
             -GitHubLogin $ProjectConfig.GitHubLogin `
             -PythonDepotPath $ProjectConfig.PythonDepotPath `
             -KnownPythonInterpreters $freshInterpreters `
@@ -5594,6 +6338,8 @@ function Add-PythonInterpreterToProjectConfig {
         -AskInstallGitHubCliWhenMissing $ProjectConfig.AskInstallGitHubCliWhenMissing `
         -AskInstallPythonManagerWhenMissing $ProjectConfig.AskInstallPythonManagerWhenMissing `
         -DefaultGitHubRepositoryVisibility $ProjectConfig.DefaultGitHubRepositoryVisibility `
+        -DefaultDjangoLanguageCode $ProjectConfig.DefaultDjangoLanguageCode `
+        -DefaultDjangoTimeZone $ProjectConfig.DefaultDjangoTimeZone `
         -GitHubLogin $ProjectConfig.GitHubLogin `
         -PythonDepotPath $ProjectConfig.PythonDepotPath `
         -KnownPythonInterpreters $knownPythonInterpreters.ToArray() `
@@ -5692,20 +6438,49 @@ function Read-PythonInterpreterSelection {
         Write-Host 'Aucune version Python connue n''a été trouvée via pymanager ou la configuration.' -ForegroundColor Yellow
     }
 
+    $latestStablePythonVersionHint = Get-LatestStablePythonVersionHint -KnownPythonInterpreters $interpreterEntries
+    $initialInstallableLookup = $null
+    if ([string]::IsNullOrWhiteSpace("$latestStablePythonVersionHint")) {
+        $initialInstallableLookup = Get-PythonInstallableRuntimeEntries -VersionRequest ''
+        $latestStablePythonVersionHint = Get-LatestStablePythonVersionHint `
+            -KnownPythonInterpreters $interpreterEntries `
+            -InstallableRuntimes @($initialInstallableLookup.Entries)
+    }
+
     while ($true) {
         $versionPrompt = if (-not [string]::IsNullOrWhiteSpace("$normalizedPreferredVersionRequest")) {
             if ($interpreterEntries.Count -gt 0) {
-                "Version Python pour le venv (exemple 3.14, Entrée = $normalizedPreferredVersionRequest recommandé)"
+                if (-not [string]::IsNullOrWhiteSpace("$latestStablePythonVersionHint")) {
+                    "Version Python pour le venv (exemple 3.14, Entrée = $normalizedPreferredVersionRequest recommandé, dernière stable : $latestStablePythonVersionHint)"
+                }
+                else {
+                    "Version Python pour le venv (exemple 3.14, Entrée = $normalizedPreferredVersionRequest recommandé)"
+                }
             }
             else {
-                "Version Python pour le venv à installer (exemple 3.14, Entrée = $normalizedPreferredVersionRequest recommandé), ou chemin Python"
+                if (-not [string]::IsNullOrWhiteSpace("$latestStablePythonVersionHint")) {
+                    "Version Python pour le venv à installer (exemple 3.14, Entrée = $normalizedPreferredVersionRequest recommandé, dernière stable : $latestStablePythonVersionHint), ou chemin Python"
+                }
+                else {
+                    "Version Python pour le venv à installer (exemple 3.14, Entrée = $normalizedPreferredVersionRequest recommandé), ou chemin Python"
+                }
             }
         }
         elseif ($interpreterEntries.Count -gt 0) {
-            'Version Python pour le venv (exemple 3.14, Entrée = versions connues et installables)'
+            if (-not [string]::IsNullOrWhiteSpace("$latestStablePythonVersionHint")) {
+                "Version Python pour le venv (exemple 3.14, Entrée = versions connues et installables, dernière stable : $latestStablePythonVersionHint)"
+            }
+            else {
+                'Version Python pour le venv (exemple 3.14, Entrée = versions connues et installables)'
+            }
         }
         else {
-            'Version Python pour le venv à installer (exemple 3.14), ou chemin Python'
+            if (-not [string]::IsNullOrWhiteSpace("$latestStablePythonVersionHint")) {
+                "Version Python pour le venv à installer (exemple 3.14, dernière stable : $latestStablePythonVersionHint), ou chemin Python"
+            }
+            else {
+                'Version Python pour le venv à installer (exemple 3.14), ou chemin Python'
+            }
         }
 
         $versionRequest = Read-Host $versionPrompt
@@ -5715,7 +6490,8 @@ function Read-PythonInterpreterSelection {
                 $versionRequest = $normalizedPreferredVersionRequest
             }
             else {
-                $installableLookup = Get-PythonInstallableRuntimeEntries -VersionRequest ''
+                $installableLookup = if ($null -ne $initialInstallableLookup) { $initialInstallableLookup } else { Get-PythonInstallableRuntimeEntries -VersionRequest '' }
+                $initialInstallableLookup = $null
                 $combinedMatches = Get-CombinedPythonReferenceMatches `
                     -KnownMatches $interpreterEntries `
                     -InstallableMatches @($installableLookup.Entries)
@@ -5776,28 +6552,24 @@ function Read-PythonInterpreterSelection {
 
         if ($interpreterEntries.Count -gt 0) {
             $matches = Get-PythonInterpreterMatchesByVersion -VersionRequest $normalizedVersionRequest -KnownPythonInterpreters $interpreterEntries
-
-            if ($matches.ExactMatches.Count -gt 0) {
-                Show-PythonReferenceMatches -Title "Références Python exactes pour '$normalizedVersionRequest' :" -Matches $matches.ExactMatches
-                $choiceResolution = Resolve-PythonReferenceChoiceForVersionRequest -Matches $matches.ExactMatches
-                if ($null -ne $choiceResolution.Selection) {
-                    return $choiceResolution.Selection
-                }
-
-                if ($choiceResolution.ReturnToPreviousStep) {
-                    continue
-                }
-                continue
-            }
-
             $installableLookup = Get-PythonInstallableRuntimeEntries -VersionRequest $normalizedVersionRequest
             $installableMatches = Get-PythonInstallableRuntimeMatchesByVersion `
                 -VersionRequest $normalizedVersionRequest `
                 -InstallableRuntimes @($installableLookup.Entries)
 
-            if ($installableMatches.ExactMatches.Count -gt 0) {
-                Show-PythonReferenceMatches -Title "Références Python exactes et installables pour '$normalizedVersionRequest' :" -Matches @($installableMatches.ExactMatches)
-                $choiceResolution = Resolve-PythonReferenceChoiceForVersionRequest -Matches @($installableMatches.ExactMatches)
+            if ($matches.ExactMatches.Count -gt 0 -or $installableMatches.ExactMatches.Count -gt 0) {
+                $exactMatches = Get-CombinedPythonReferenceMatches `
+                    -KnownMatches $matches.ExactMatches `
+                    -InstallableMatches @($installableMatches.ExactMatches)
+
+                if ($installableMatches.ExactMatches.Count -gt 0) {
+                    Show-PythonReferenceMatches -Title "Références Python exactes et installables pour '$normalizedVersionRequest' :" -Matches $exactMatches
+                }
+                else {
+                    Show-PythonReferenceMatches -Title "Références Python exactes pour '$normalizedVersionRequest' :" -Matches $exactMatches
+                }
+
+                $choiceResolution = Resolve-PythonReferenceChoiceForVersionRequest -Matches $exactMatches
                 if ($null -ne $choiceResolution.Selection) {
                     return $choiceResolution.Selection
                 }
@@ -6298,9 +7070,10 @@ try {
             -ProjectPath $projectPath `
             -ProjectType $ProjectType | Out-Null
 
-        if ($ProjectType -eq 'py') {
+        if (Test-PythonBasedProjectType -ProjectType $ProjectType) {
             $createPythonVenv = $false
             $selectedPythonVersionRequest = $null
+            $selectedDjangoVersion = $null
             $createPythonVenv = Read-CreatePythonVenv -DefaultCreatePythonVenv $projectConfig.DefaultCreatePythonVenv
 
             if ($createPythonVenv) {
@@ -6326,6 +7099,24 @@ try {
             New-PythonProjectCmdVenvLauncher `
                 -ProjectPath $projectPath `
                 -ProjectName $ProjectName | Out-Null
+
+            if ($ProjectType -eq 'django') {
+                if ($createPythonVenv) {
+                    $availableDjangoVersions = @(Get-AvailableDjangoPackageVersions)
+                    $selectedDjangoVersion = Read-DjangoVersionSelection -AvailableVersions $availableDjangoVersions
+                    Install-DjangoInVirtualEnvironment -ProjectPath $projectPath -DjangoVersion $selectedDjangoVersion | Out-Null
+                    $defaultDjangoProjectName = Get-NormalizedDjangoProjectName -ProjectName $ProjectName
+                    $selectedDjangoProjectName = Ensure-DjangoProjectStructure -ProjectPath $projectPath -DefaultDjangoProjectName $defaultDjangoProjectName
+                    Update-DjangoProjectSettingsFile `
+                        -ProjectPath $projectPath `
+                        -DjangoProjectName $selectedDjangoProjectName `
+                        -LanguageCode $projectConfig.DefaultDjangoLanguageCode `
+                        -TimeZone $projectConfig.DefaultDjangoTimeZone | Out-Null
+                }
+                else {
+                    Write-Host 'Aucun venv créé : l''installation automatique de Django est ignorée.' -ForegroundColor Yellow
+                }
+            }
         }
 
         if ($canCreateGitHubRepository) {
