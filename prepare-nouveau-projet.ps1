@@ -37,6 +37,8 @@ $script:OriginalConsoleOutputEncoding = $null
 $script:OriginalCommandOutputEncoding = $null
 $script:OriginalConsoleCodePage = $null
 $script:OriginalLocation = $null
+$script:InternetModelRecoveryConsent = $null
+$script:PublicRepositoryTreePathsCache = $null
 
 function Set-Utf8ConsoleEncoding {
     $utf8Encoding = [System.Text.UTF8Encoding]::new($false)
@@ -331,6 +333,19 @@ function Get-ProjectModelContent {
     }
 
     if ([string]::IsNullOrWhiteSpace($content)) {
+        $downloadedMissingModels = Restore-MissingProjectModelsFromPublicGitHub `
+            -LogicalFileName $LogicalFileName `
+            -ProjectType $ProjectType `
+            -OnlySpecificAdditions:$OnlySpecificAdditions
+
+        if ($downloadedMissingModels) {
+            return Get-ProjectModelContent `
+                -LogicalFileName $LogicalFileName `
+                -ProjectType $ProjectType `
+                -Variables $Variables `
+                -OnlySpecificAdditions:$OnlySpecificAdditions
+        }
+
         throw "Aucun modèle exploitable n'a été trouvé pour '$LogicalFileName' (type : $ProjectType)."
     }
 
@@ -3607,6 +3622,98 @@ function Get-AutomaticGitCommitMessage {
         'project-init' { return 'Initialisation du projet / Project initialization' }
         'project-update' { return 'Mise à jour du projet via prepare-nouveau-projet.ps1 / Project update via prepare-nouveau-projet.ps1' }
     }
+}
+
+function Get-ExpectedModelRelativePaths {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $LogicalFileName,
+
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectType,
+
+        [switch] $OnlySpecificAdditions
+    )
+
+    $relativePaths = [System.Collections.Generic.List[string]]::new()
+
+    if (-not $OnlySpecificAdditions) {
+        $relativePaths.Add(("prepare-nouveau-projet/models/$LogicalFileName").Replace('\', '/'))
+    }
+
+    foreach ($modelFolder in @(Get-ProjectTypeModelFolders -ProjectType $ProjectType)) {
+        if (-not $OnlySpecificAdditions) {
+            $relativePaths.Add(("prepare-nouveau-projet/models/$modelFolder/remplace_$LogicalFileName").Replace('\', '/'))
+        }
+
+        $relativePaths.Add(("prepare-nouveau-projet/models/$modelFolder/ajout_$LogicalFileName").Replace('\', '/'))
+    }
+
+    return @($relativePaths.ToArray())
+}
+
+function Ensure-InternetModelRecoveryConsent {
+    if ($null -ne $script:InternetModelRecoveryConsent) {
+        return [bool] $script:InternetModelRecoveryConsent
+    }
+
+    $script:InternetModelRecoveryConsent = Read-ConfirmationWithDefault `
+        -Prompt 'Des modèles locaux sont manquants. Voulez-vous autoriser une connexion Internet pour les retélécharger depuis le GitHub public ?' `
+        -DefaultValue $false
+
+    return [bool] $script:InternetModelRecoveryConsent
+}
+
+function Get-CachedPublicGitHubRepositoryTreePaths {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $RepositoryReference
+    )
+
+    if ($null -eq $script:PublicRepositoryTreePathsCache) {
+        $script:PublicRepositoryTreePathsCache = @(Get-PublicGitHubRepositoryTreePaths -RepositoryReference $RepositoryReference)
+    }
+
+    return @($script:PublicRepositoryTreePathsCache)
+}
+
+function Restore-MissingProjectModelsFromPublicGitHub {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $LogicalFileName,
+
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectType,
+
+        [switch] $OnlySpecificAdditions
+    )
+
+    if (-not (Ensure-InternetModelRecoveryConsent)) {
+        return $false
+    }
+
+    $repositoryReference = Get-PublicGitHubRepositoryReference -ProjectPath $PSScriptRoot
+    $availablePaths = @(Get-CachedPublicGitHubRepositoryTreePaths -RepositoryReference $repositoryReference)
+    $expectedPaths = @(Get-ExpectedModelRelativePaths -LogicalFileName $LogicalFileName -ProjectType $ProjectType -OnlySpecificAdditions:$OnlySpecificAdditions)
+    $downloadedAnyModel = $false
+
+    foreach ($relativePath in @($expectedPaths)) {
+        if ($availablePaths -notcontains $relativePath) {
+            continue
+        }
+
+        $localPath = Join-Path -Path $PSScriptRoot -ChildPath ($relativePath -replace '/', '\')
+        if (Test-Path -LiteralPath $localPath) {
+            continue
+        }
+
+        $downloadUrl = Get-PublicGitHubRawContentUrl -RepositoryReference $repositoryReference -RelativePath $relativePath
+        Invoke-InternetDownloadToFile -Url $downloadUrl -DestinationPath $localPath
+        Write-Host "Modèle téléchargé : $localPath" -ForegroundColor Green
+        $downloadedAnyModel = $true
+    }
+
+    return $downloadedAnyModel
 }
 
 function Invoke-InternetDownloadToFile {
