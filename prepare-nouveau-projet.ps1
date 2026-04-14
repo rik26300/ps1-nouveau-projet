@@ -38,7 +38,7 @@ $script:OriginalConsoleOutputEncoding = $null
 $script:OriginalCommandOutputEncoding = $null
 $script:OriginalConsoleCodePage = $null
 $script:OriginalLocation = $null
-$script:InternetModelRecoveryConsent = $null
+$script:PublicGitHubInternetConsent = $null
 $script:PublicRepositoryTreePathsCache = $null
 
 function Set-Utf8ConsoleEncoding {
@@ -3668,16 +3668,27 @@ function Get-ExpectedModelRelativePaths {
     return @($relativePaths.ToArray())
 }
 
-function Ensure-InternetModelRecoveryConsent {
-    if ($null -ne $script:InternetModelRecoveryConsent) {
-        return [bool] $script:InternetModelRecoveryConsent
+function Ensure-PublicGitHubInternetConsent {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Prompt,
+
+        [bool] $DefaultValue = $false
+    )
+
+    if ($true -eq $script:PublicGitHubInternetConsent) {
+        return [bool] $script:PublicGitHubInternetConsent
     }
 
-    $script:InternetModelRecoveryConsent = Read-ConfirmationWithDefault `
-        -Prompt 'Des modèles locaux sont manquants. Voulez-vous autoriser une connexion Internet pour les retélécharger depuis le GitHub public ?' `
-        -DefaultValue $false
+    $allowInternet = Read-ConfirmationWithDefault `
+        -Prompt $Prompt `
+        -DefaultValue $DefaultValue
 
-    return [bool] $script:InternetModelRecoveryConsent
+    if ($allowInternet) {
+        $script:PublicGitHubInternetConsent = $true
+    }
+
+    return [bool] $allowInternet
 }
 
 function Get-CachedPublicGitHubRepositoryTreePaths {
@@ -3693,6 +3704,63 @@ function Get-CachedPublicGitHubRepositoryTreePaths {
     return @($script:PublicRepositoryTreePathsCache)
 }
 
+function Get-PublicGitHubScriptVersion {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $RepositoryReference
+    )
+
+    $scriptUrl = Get-PublicGitHubRawContentUrl -RepositoryReference $RepositoryReference -RelativePath 'prepare-nouveau-projet.ps1'
+    $response = Invoke-WebRequest `
+        -Uri $scriptUrl `
+        -UseBasicParsing `
+        -Headers @{ 'User-Agent' = 'prepare-nouveau-projet' }
+
+    $scriptContent = if ($null -eq $response) { '' } else { "$($response.Content)" }
+    if ([string]::IsNullOrWhiteSpace($scriptContent)) {
+        throw "Impossible de lire la version distante depuis '$scriptUrl'."
+    }
+
+    $versionMatch = [System.Text.RegularExpressions.Regex]::Match($scriptContent, "\$ScriptVersion\s*=\s*\[Version\]\s*'(?<version>[^']+)'")
+    if (-not $versionMatch.Success) {
+        throw "Impossible d'extraire la version distante depuis '$scriptUrl'."
+    }
+
+    return [Version] $versionMatch.Groups['version'].Value.Trim()
+}
+
+function Show-ScriptVersionAndOfferUpdate {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ScriptRoot
+    )
+
+    Write-Host "Version du script : $($ScriptVersion.ToString())" -ForegroundColor Cyan
+
+    if (-not (Ensure-PublicGitHubInternetConsent `
+            -Prompt 'Voulez-vous autoriser une connexion Internet pour vérifier si une version plus récente du script existe sur le GitHub public ?' `
+            -DefaultValue $false)) {
+        return $false
+    }
+
+    $repositoryReference = Get-PublicGitHubRepositoryReference -ProjectPath $ScriptRoot
+    $remoteVersion = Get-PublicGitHubScriptVersion -RepositoryReference $repositoryReference
+
+    if ($remoteVersion -le $ScriptVersion) {
+        Write-Host "Aucune version plus récente détectée sur GitHub. Version distante : $($remoteVersion.ToString())" -ForegroundColor Green
+        return $false
+    }
+
+    Write-Host "Version plus récente disponible sur GitHub : $($remoteVersion.ToString())" -ForegroundColor Yellow
+    $updateNow = Read-ConfirmationWithDefault -Prompt 'Voulez-vous lancer la mise à jour du script maintenant ?' -DefaultValue $true
+    if (-not $updateNow) {
+        return $false
+    }
+
+    Invoke-ScriptSelfUpdateFromPublicGitHub -ScriptRoot $ScriptRoot -SkipInternetConfirmation
+    return $true
+}
+
 function Restore-MissingProjectModelsFromPublicGitHub {
     param(
         [Parameter(Mandatory = $true)]
@@ -3704,7 +3772,9 @@ function Restore-MissingProjectModelsFromPublicGitHub {
         [switch] $OnlySpecificAdditions
     )
 
-    if (-not (Ensure-InternetModelRecoveryConsent)) {
+    if (-not (Ensure-PublicGitHubInternetConsent `
+            -Prompt 'Des modèles locaux sont manquants. Voulez-vous autoriser une connexion Internet pour les retélécharger depuis le GitHub public ?' `
+            -DefaultValue $false)) {
         return $false
     }
 
@@ -3882,16 +3952,20 @@ function Sync-ScriptFilesFromPublicGitHub {
 function Invoke-ScriptSelfUpdateFromPublicGitHub {
     param(
         [Parameter(Mandatory = $true)]
-        [string] $ScriptRoot
+        [string] $ScriptRoot,
+
+        [switch] $SkipInternetConfirmation
     )
 
-    $allowInternet = Read-ConfirmationWithDefault `
-        -Prompt 'Cette opération va se connecter à Internet pour vérifier le dépôt GitHub public et télécharger les fichiers nécessaires. Continuer ?' `
-        -DefaultValue $false
+    if (-not $SkipInternetConfirmation) {
+        $allowInternet = Ensure-PublicGitHubInternetConsent `
+            -Prompt 'Cette opération va se connecter à Internet pour vérifier le dépôt GitHub public et télécharger les fichiers nécessaires. Continuer ?' `
+            -DefaultValue $false
 
-    if (-not $allowInternet) {
-        Write-Host 'Mise à jour du script annulée.' -ForegroundColor Yellow
-        return
+        if (-not $allowInternet) {
+            Write-Host 'Mise à jour du script annulée.' -ForegroundColor Yellow
+            return
+        }
     }
 
     $repositoryReference = Get-PublicGitHubRepositoryReference -ProjectPath $ScriptRoot
@@ -7509,6 +7583,10 @@ try {
 
     if ($UpdateScript) {
         Invoke-ScriptSelfUpdateFromPublicGitHub -ScriptRoot $PSScriptRoot
+        return
+    }
+
+    if (Show-ScriptVersionAndOfferUpdate -ScriptRoot $PSScriptRoot) {
         return
     }
 
