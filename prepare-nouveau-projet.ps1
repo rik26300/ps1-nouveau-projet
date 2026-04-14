@@ -10,7 +10,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = [Version] '2.0.2'
+$ScriptVersion = [Version] '2.0.3'
 $CurrentConfigVersion = 13
 $LegacyConfigVersion = 1
 $ConfigFileName = 'prepare-nouveau-projet.config.json'
@@ -4081,6 +4081,27 @@ function Update-ExistingProjectSetup {
                 Path = $agentsPath
                 Description = 'Créer AGENTS.md'
                 Content = (Get-ProjectAgentsContent -ProjectType $projectTypeToUpdate)
+                WithoutBom = $false
+            })
+    }
+
+    $readmePath = Join-Path -Path $ProjectPath -ChildPath 'README.md'
+    $expectedReadmeContent = Get-ProjectReadmeContent -ProjectName $ProjectName -ProjectType $projectTypeToUpdate
+    if (-not (Test-Path -LiteralPath $readmePath)) {
+        $changes.Add([PSCustomObject]@{
+                Type = 'WriteFile'
+                Path = $readmePath
+                Description = 'Créer README.md'
+                Content = $expectedReadmeContent
+                WithoutBom = $false
+            })
+    }
+    elseif (-not (Test-TextFileContentMatches -Path $readmePath -ExpectedContent $expectedReadmeContent)) {
+        $changes.Add([PSCustomObject]@{
+                Type = 'WriteFile'
+                Path = $readmePath
+                Description = 'Mettre à jour README.md'
+                Content = $expectedReadmeContent
                 WithoutBom = $false
             })
     }
