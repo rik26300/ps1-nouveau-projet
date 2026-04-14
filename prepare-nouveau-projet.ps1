@@ -3721,12 +3721,23 @@ function Get-PublicGitHubScriptVersion {
         throw "Impossible de lire la version distante depuis '$scriptUrl'."
     }
 
-    $versionMatch = [System.Text.RegularExpressions.Regex]::Match($scriptContent, "\$ScriptVersion\s*=\s*\[Version\]\s*'(?<version>[^']+)'")
-    if (-not $versionMatch.Success) {
-        throw "Impossible d'extraire la version distante depuis '$scriptUrl'."
+    $versionPatterns = @(
+        '(?m)^\s*\$ScriptVersion\s*=\s*\[Version\]\s*[''"](?<version>[^''""]+)[''"]',
+        '(?m)^\s*\$ScriptVersion\s*=\s*[''"](?<version>[^''""]+)[''"]'
+    )
+
+    foreach ($versionPattern in @($versionPatterns)) {
+        $versionMatch = [System.Text.RegularExpressions.Regex]::Match($scriptContent, $versionPattern)
+        if ($versionMatch.Success) {
+            return [Version] $versionMatch.Groups['version'].Value.Trim()
+        }
     }
 
-    return [Version] $versionMatch.Groups['version'].Value.Trim()
+    if ($scriptContent -match '(?is)<\s*!DOCTYPE\s+html|<\s*html\b') {
+        throw "Le contenu distant reçu depuis '$scriptUrl' est une page HTML inattendue, pas le script PowerShell attendu."
+    }
+
+    throw "Impossible d'extraire la version distante depuis '$scriptUrl'."
 }
 
 function Show-ScriptVersionAndOfferUpdate {
