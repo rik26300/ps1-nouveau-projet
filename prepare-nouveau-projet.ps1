@@ -38,7 +38,6 @@ $script:OriginalConsoleOutputEncoding = $null
 $script:OriginalCommandOutputEncoding = $null
 $script:OriginalConsoleCodePage = $null
 $script:OriginalLocation = $null
-$script:PublicGitHubInternetConsent = $null
 $script:PublicRepositoryTreePathsCache = $null
 
 function Set-Utf8ConsoleEncoding {
@@ -3668,29 +3667,6 @@ function Get-ExpectedModelRelativePaths {
     return @($relativePaths.ToArray())
 }
 
-function Ensure-PublicGitHubInternetConsent {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string] $Prompt,
-
-        [bool] $DefaultValue = $false
-    )
-
-    if ($true -eq $script:PublicGitHubInternetConsent) {
-        return [bool] $script:PublicGitHubInternetConsent
-    }
-
-    $allowInternet = Read-ConfirmationWithDefault `
-        -Prompt $Prompt `
-        -DefaultValue $DefaultValue
-
-    if ($allowInternet) {
-        $script:PublicGitHubInternetConsent = $true
-    }
-
-    return [bool] $allowInternet
-}
-
 function Get-CachedPublicGitHubRepositoryTreePaths {
     param(
         [Parameter(Mandatory = $true)]
@@ -3748,12 +3724,6 @@ function Show-ScriptVersionAndOfferUpdate {
 
     Write-Host "Version du script : $($ScriptVersion.ToString())" -ForegroundColor Cyan
 
-    if (-not (Ensure-PublicGitHubInternetConsent `
-            -Prompt 'Voulez-vous autoriser une connexion Internet pour vérifier si une version plus récente du script existe sur le GitHub public ?' `
-            -DefaultValue $false)) {
-        return $false
-    }
-
     $repositoryReference = Get-PublicGitHubRepositoryReference -ProjectPath $ScriptRoot
     $remoteVersion = Get-PublicGitHubScriptVersion -RepositoryReference $repositoryReference
 
@@ -3783,15 +3753,10 @@ function Restore-MissingProjectModelsFromPublicGitHub {
         [switch] $OnlySpecificAdditions
     )
 
-    if (-not (Ensure-PublicGitHubInternetConsent `
-            -Prompt 'Des modèles locaux sont manquants. Voulez-vous autoriser une connexion Internet pour les retélécharger depuis le GitHub public ?' `
-            -DefaultValue $false)) {
-        return $false
-    }
-
     $repositoryReference = Get-PublicGitHubRepositoryReference -ProjectPath $PSScriptRoot
     $availablePaths = @(Get-CachedPublicGitHubRepositoryTreePaths -RepositoryReference $repositoryReference)
     $expectedPaths = @(Get-ExpectedModelRelativePaths -LogicalFileName $LogicalFileName -ProjectType $ProjectType -OnlySpecificAdditions:$OnlySpecificAdditions)
+    $missingDownloadCandidates = [System.Collections.Generic.List[object]]::new()
     $downloadedAnyModel = $false
 
     foreach ($relativePath in @($expectedPaths)) {
@@ -3804,9 +3769,33 @@ function Restore-MissingProjectModelsFromPublicGitHub {
             continue
         }
 
-        $downloadUrl = Get-PublicGitHubRawContentUrl -RepositoryReference $repositoryReference -RelativePath $relativePath
-        Invoke-InternetDownloadToFile -Url $downloadUrl -DestinationPath $localPath
-        Write-Host "Modèle téléchargé : $localPath" -ForegroundColor Green
+        $missingDownloadCandidates.Add([PSCustomObject]@{
+                RelativePath = $relativePath
+                LocalPath = $localPath
+            })
+    }
+
+    if ($missingDownloadCandidates.Count -eq 0) {
+        return $false
+    }
+
+    Write-Host 'Des modèles manquants ont été trouvés sur le GitHub public :' -ForegroundColor Yellow
+    foreach ($candidate in @($missingDownloadCandidates.ToArray())) {
+        Write-Host "- $($candidate.RelativePath)"
+    }
+
+    $downloadMissingModels = Read-ConfirmationWithDefault `
+        -Prompt 'Voulez-vous télécharger ces modèles manquants maintenant ?' `
+        -DefaultValue $true
+
+    if (-not $downloadMissingModels) {
+        return $false
+    }
+
+    foreach ($candidate in @($missingDownloadCandidates.ToArray())) {
+        $downloadUrl = Get-PublicGitHubRawContentUrl -RepositoryReference $repositoryReference -RelativePath $candidate.RelativePath
+        Invoke-InternetDownloadToFile -Url $downloadUrl -DestinationPath $candidate.LocalPath
+        Write-Host "Modèle téléchargé : $($candidate.LocalPath)" -ForegroundColor Green
         $downloadedAnyModel = $true
     }
 
@@ -3967,17 +3956,6 @@ function Invoke-ScriptSelfUpdateFromPublicGitHub {
 
         [switch] $SkipInternetConfirmation
     )
-
-    if (-not $SkipInternetConfirmation) {
-        $allowInternet = Ensure-PublicGitHubInternetConsent `
-            -Prompt 'Cette opération va se connecter à Internet pour vérifier le dépôt GitHub public et télécharger les fichiers nécessaires. Continuer ?' `
-            -DefaultValue $false
-
-        if (-not $allowInternet) {
-            Write-Host 'Mise à jour du script annulée.' -ForegroundColor Yellow
-            return
-        }
-    }
 
     $repositoryReference = Get-PublicGitHubRepositoryReference -ProjectPath $ScriptRoot
     Write-StepInfo "Connexion au dépôt public : $($repositoryReference.RepositoryUrl) (branche : $($repositoryReference.Branch))"
