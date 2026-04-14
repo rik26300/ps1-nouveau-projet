@@ -10,7 +10,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = [Version] '2.0.1'
+$ScriptVersion = [Version] '2.0.2'
 $CurrentConfigVersion = 13
 $LegacyConfigVersion = 1
 $ConfigFileName = 'prepare-nouveau-projet.config.json'
@@ -3724,8 +3724,14 @@ function Show-ScriptVersionAndOfferUpdate {
 
     Write-Host "Version du script : $($ScriptVersion.ToString())" -ForegroundColor Cyan
 
-    $repositoryReference = Get-PublicGitHubRepositoryReference -ProjectPath $ScriptRoot
-    $remoteVersion = Get-PublicGitHubScriptVersion -RepositoryReference $repositoryReference
+    try {
+        $repositoryReference = Get-PublicGitHubRepositoryReference -ProjectPath $ScriptRoot
+        $remoteVersion = Get-PublicGitHubScriptVersion -RepositoryReference $repositoryReference
+    }
+    catch {
+        Write-Host "Vérification de version GitHub ignorée : $($_.Exception.Message)" -ForegroundColor Yellow
+        return $false
+    }
 
     if ($remoteVersion -le $ScriptVersion) {
         Write-Host "Aucune version plus récente détectée sur GitHub. Version distante : $($remoteVersion.ToString())" -ForegroundColor Green
@@ -4937,7 +4943,7 @@ function Read-DjangoProjectName {
     }
 }
 
-function Get-PythonProjectReadmeContent {
+function Get-ProjectReadmeContent {
     param(
         [Parameter(Mandatory = $true)]
         [string] $ProjectName,
@@ -4953,7 +4959,7 @@ function Get-PythonProjectReadmeContent {
         -Variables (Get-ProjectTemplateVariables -ProjectName $ProjectName -ProjectType $ProjectType -HasVirtualEnvironment $HasVirtualEnvironment)
 }
 
-function New-PythonProjectReadme {
+function New-ProjectReadme {
     param(
         [Parameter(Mandatory = $true)]
         [string] $ProjectPath,
@@ -4973,10 +4979,39 @@ function New-PythonProjectReadme {
         return $readmePath
     }
 
-    $content = Get-PythonProjectReadmeContent -ProjectName $ProjectName -HasVirtualEnvironment $HasVirtualEnvironment -ProjectType $ProjectType
+    $content = Get-ProjectReadmeContent -ProjectName $ProjectName -HasVirtualEnvironment $HasVirtualEnvironment -ProjectType $ProjectType
     Write-Utf8TextFile -Path $readmePath -Content $content
     Write-Host "README créé : $readmePath" -ForegroundColor Green
     return $readmePath
+}
+
+function Get-PythonProjectReadmeContent {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectName,
+
+        [bool] $HasVirtualEnvironment = $false,
+
+        [string] $ProjectType = 'py'
+    )
+
+    return Get-ProjectReadmeContent -ProjectName $ProjectName -HasVirtualEnvironment $HasVirtualEnvironment -ProjectType $ProjectType
+}
+
+function New-PythonProjectReadme {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectPath,
+
+        [Parameter(Mandatory = $true)]
+        [string] $ProjectName,
+
+        [bool] $HasVirtualEnvironment = $false,
+
+        [string] $ProjectType = 'py'
+    )
+
+    return New-ProjectReadme -ProjectPath $ProjectPath -ProjectName $ProjectName -HasVirtualEnvironment $HasVirtualEnvironment -ProjectType $ProjectType
 }
 
 function Get-PythonProjectRequirementsContent {
@@ -7698,6 +7733,13 @@ try {
         New-ProjectAgentsFile `
             -ProjectPath $projectPath `
             -ProjectType $ProjectType | Out-Null
+
+        if (-not (Test-PythonBasedProjectType -ProjectType $ProjectType)) {
+            New-ProjectReadme `
+                -ProjectPath $projectPath `
+                -ProjectName $ProjectName `
+                -ProjectType $ProjectType | Out-Null
+        }
 
         if (Test-PythonBasedProjectType -ProjectType $ProjectType) {
             $createPythonVenv = $false
