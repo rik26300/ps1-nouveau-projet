@@ -10,7 +10,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = [Version] '2.0.4'
+$ScriptVersion = [Version] '2.0.5'
 $CurrentConfigVersion = 13
 $LegacyConfigVersion = 1
 $ConfigFileName = 'prepare-nouveau-projet.config.json'
@@ -6534,6 +6534,9 @@ function Get-LatestStablePythonVersionHint {
     $versionCandidates = [System.Collections.Generic.List[string]]::new()
 
     foreach ($knownInterpreter in @(ConvertTo-CanonicalPythonInterpreterEntries -Entries $KnownPythonInterpreters)) {
+        if ("$($knownInterpreter.Version)" -match '(?i)\d(?:a|b|rc)\d|\b(?:alpha|beta|preview|dev)\b') {
+            continue
+        }
         $versionLabel = Get-PythonVersionLabelText -VersionText "$($knownInterpreter.Version)"
         if (-not [string]::IsNullOrWhiteSpace($versionLabel) -and $versionCandidates -notcontains $versionLabel) {
             $versionCandidates.Add($versionLabel)
@@ -6541,6 +6544,10 @@ function Get-LatestStablePythonVersionHint {
     }
 
     foreach ($installableRuntime in @(ConvertTo-CanonicalPythonInstallableRuntimeEntries -Entries $InstallableRuntimes)) {
+        $releaseText = "$($installableRuntime.Version) $($installableRuntime.DisplayName) $($installableRuntime.InstallTag)"
+        if ($releaseText -match '(?i)\d(?:a|b|rc)\d|\b(?:alpha|beta|preview|dev)\b') {
+            continue
+        }
         $versionLabel = Get-PythonVersionLabelText -VersionText "$($installableRuntime.Version)"
         if (-not [string]::IsNullOrWhiteSpace($versionLabel) -and $versionCandidates -notcontains $versionLabel) {
             $versionCandidates.Add($versionLabel)
@@ -7111,14 +7118,10 @@ function Read-PythonInterpreterSelection {
         Write-Host 'Aucune version Python connue n''a été trouvée via pymanager ou la configuration.' -ForegroundColor Yellow
     }
 
-    $latestStablePythonVersionHint = Get-LatestStablePythonVersionHint -KnownPythonInterpreters $interpreterEntries
-    $initialInstallableLookup = $null
-    if ([string]::IsNullOrWhiteSpace("$latestStablePythonVersionHint")) {
-        $initialInstallableLookup = Get-PythonInstallableRuntimeEntries -VersionRequest ''
-        $latestStablePythonVersionHint = Get-LatestStablePythonVersionHint `
-            -KnownPythonInterpreters $interpreterEntries `
-            -InstallableRuntimes @($initialInstallableLookup.Entries)
-    }
+    $initialInstallableLookup = Get-PythonInstallableRuntimeEntries -VersionRequest ''
+    $latestStablePythonVersionHint = Get-LatestStablePythonVersionHint `
+        -KnownPythonInterpreters $interpreterEntries `
+        -InstallableRuntimes @($initialInstallableLookup.Entries)
 
     while ($true) {
         $versionPrompt = if (-not [string]::IsNullOrWhiteSpace("$normalizedPreferredVersionRequest")) {
