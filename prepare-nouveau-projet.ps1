@@ -10,12 +10,12 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = [Version] '2.0.5'
+$ScriptVersion = [Version] '3.0.0'
 $CurrentConfigVersion = 13
 $LegacyConfigVersion = 1
 $ConfigFileName = 'prepare-nouveau-projet.config.json'
 $ConfigDisabledSuffix = 'desactive'
-$KnownProjectTypes = @('cmd', 'bat', 'ps1', 'py', 'django', 'autre')
+$KnownProjectTypes = @('cmd', 'bat', 'ps1', 'py', 'django', 'django-app', 'autre')
 $KnownProjectTypesDisplay = $KnownProjectTypes -join ', '
 $FallbackProjectType = 'django'
 $FallbackCreatePythonVenv = $true
@@ -232,7 +232,7 @@ function Test-PythonBasedProjectType {
     )
 
     $normalizedProjectType = if ($null -eq $ProjectType) { '' } else { $ProjectType.Trim().ToLowerInvariant() }
-    return ($normalizedProjectType -in @('py', 'django'))
+    return ($normalizedProjectType -in @('py', 'django', 'django-app'))
 }
 
 function Get-ProjectTypeModelFolders {
@@ -245,6 +245,7 @@ function Get-ProjectTypeModelFolders {
 
     switch ($normalizedProjectType) {
         'django' { return @('python', 'django') }
+        'django-app' { return @('python', 'django', 'django-app') }
         'py' { return @('python') }
         'ps1' { return @('powershell') }
         default { return @() }
@@ -633,6 +634,7 @@ function Read-ProjectType {
     )
 
     Write-Host "Types de projet connus : $KnownProjectTypesDisplay"
+    Write-Host 'django : site autonome ; django-app : application réutilisable avec site de développement hors Git.'
 
     while ($true) {
         $projectType = Read-Host "Type du projet (Entrée = $DefaultProjectType)"
@@ -652,6 +654,11 @@ function Get-DetectedExistingProjectType {
         [string] $ProjectPath
     )
 
+    $dossierDev = Get-ProjectDevelopmentPath -ProjectPath $ProjectPath
+    $fichierType = Join-Path $dossierDev 'type-projet.txt'
+    if ($dossierDev -ne $ProjectPath -and (Test-Path -LiteralPath $fichierType)) {
+        return Get-NormalizedProjectType -ProjectType ([System.IO.File]::ReadAllText($fichierType).Trim())
+    }
     if (Test-PythonProjectPath -ProjectPath $ProjectPath) {
         $managePyPath = Join-Path -Path $ProjectPath -ChildPath 'manage.py'
         if (Test-Path -LiteralPath $managePyPath) {
@@ -2961,7 +2968,7 @@ function Get-PythonProjectDatedRequirementsFiles {
     )
 
     return @(Get-ChildItem -LiteralPath $ProjectPath -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match '^\d{4}-\d{2}-\d{2}requirements\.txt$' })
+        Where-Object { $_.Name -match '^(?:\d{4}-\d{2}-\d{2})?requirements\.txt$' })
 }
 
 function Get-PythonProjectReadmeSupplementContent {
@@ -3286,9 +3293,9 @@ function Get-ImportedPythonProjectSetupPlan {
         [string] $RecommendedPythonVersionRequest = $null
     )
 
-    $finalHasVirtualEnvironment = $WillCreateVirtualEnvironment -or (Test-Path -LiteralPath (Join-Path -Path $ProjectPath -ChildPath '.venv'))
+    $finalHasVirtualEnvironment = $WillCreateVirtualEnvironment -or (Test-Path -LiteralPath (Get-ProjectVirtualEnvironmentPath -ProjectPath $ProjectPath))
     $changes = [System.Collections.Generic.List[object]]::new()
-    $agentsPath = Join-Path -Path $ProjectPath -ChildPath 'AGENTS.md'
+    $agentsPath = Join-Path -Path (Get-ProjectDevelopmentPath -ProjectPath $ProjectPath) -ChildPath 'AGENTS.md'
 
     if (-not (Test-Path -LiteralPath $agentsPath)) {
         $changes.Add([PSCustomObject]@{
@@ -3306,7 +3313,7 @@ function Get-ImportedPythonProjectSetupPlan {
                 Type = 'WriteFile'
                 Path = $readmePath
                 Description = 'Créer README.md'
-                Content = (Get-PythonProjectReadmeContent -ProjectName $ProjectName -HasVirtualEnvironment $finalHasVirtualEnvironment -ProjectType $ProjectType)
+                Content = (Get-ProjectReadmeContent -ProjectName $ProjectName -HasVirtualEnvironment $finalHasVirtualEnvironment -ProjectType $ProjectType -ProjectPath $ProjectPath)
                 WithoutBom = $false
             })
     }
@@ -3354,7 +3361,8 @@ function Get-ImportedPythonProjectSetupPlan {
 
     $datedRequirementsFiles = @(Get-PythonProjectDatedRequirementsFiles -ProjectPath $ProjectPath)
     if ($datedRequirementsFiles.Count -eq 0) {
-        $requirementsPath = Join-Path -Path $ProjectPath -ChildPath (Get-PythonRequirementsFileName)
+        $nomDependances = if ((Get-ProjectDevelopmentPath -ProjectPath $ProjectPath) -ne $ProjectPath) { 'requirements.txt' } else { Get-PythonRequirementsFileName }
+        $requirementsPath = Join-Path -Path $ProjectPath -ChildPath $nomDependances
         $changes.Add([PSCustomObject]@{
                 Type = 'WriteFile'
                 Path = $requirementsPath
@@ -3409,7 +3417,7 @@ function Get-ImportedPythonProjectSetupPlan {
     }
 
     if ($finalHasVirtualEnvironment) {
-        $cmdVenvPath = Join-Path -Path $ProjectPath -ChildPath 'cmdVenv.cmd'
+        $cmdVenvPath = Join-Path -Path (Get-ProjectDevelopmentPath -ProjectPath $ProjectPath) -ChildPath 'cmdVenv.cmd'
         $expectedCmdVenvContent = Get-PythonProjectCmdVenvLauncherContent -ProjectName $ProjectName -ProjectType $ProjectType
         if (-not (Test-Path -LiteralPath $cmdVenvPath)) {
             $changes.Add([PSCustomObject]@{
@@ -3436,7 +3444,7 @@ function Get-ImportedPythonProjectSetupPlan {
     if ($WillCreateVirtualEnvironment) {
         $changes.Add([PSCustomObject]@{
                 Type = 'CreateVenv'
-                Path = (Join-Path -Path $ProjectPath -ChildPath '.venv')
+                Path = (Get-ProjectVirtualEnvironmentPath -ProjectPath $ProjectPath)
                 Description = 'Créer le venv Python ".venv"'
                 Category = 'Venv'
             })
@@ -4073,7 +4081,7 @@ function Update-ExistingProjectSetup {
     $projectTypeToUpdate = $projectTypeSelection.NormalizedProjectType
     $gitIgnorePath = Join-Path -Path $ProjectPath -ChildPath '.gitignore'
     $changes = [System.Collections.Generic.List[object]]::new()
-    $agentsPath = Join-Path -Path $ProjectPath -ChildPath 'AGENTS.md'
+    $agentsPath = Join-Path -Path (Get-ProjectDevelopmentPath -ProjectPath $ProjectPath) -ChildPath 'AGENTS.md'
 
     if (-not (Test-Path -LiteralPath $agentsPath)) {
         $changes.Add([PSCustomObject]@{
@@ -4086,7 +4094,7 @@ function Update-ExistingProjectSetup {
     }
 
     $readmePath = Join-Path -Path $ProjectPath -ChildPath 'README.md'
-    $expectedReadmeContent = Get-ProjectReadmeContent -ProjectName $ProjectName -ProjectType $projectTypeToUpdate
+    $expectedReadmeContent = Get-ProjectReadmeContent -ProjectName $ProjectName -ProjectType $projectTypeToUpdate -ProjectPath $ProjectPath
     if (-not (Test-Path -LiteralPath $readmePath)) {
         $changes.Add([PSCustomObject]@{
                 Type = 'WriteFile'
@@ -4184,7 +4192,7 @@ function Initialize-ImportedPythonProjectEnvironment {
         }
     }
 
-    $venvPath = Join-Path -Path $ProjectPath -ChildPath '.venv'
+    $venvPath = Get-ProjectVirtualEnvironmentPath -ProjectPath $ProjectPath
     $hasExistingVirtualEnvironment = Test-Path -LiteralPath $venvPath
     $shouldCreatePythonVenv = $false
     if (-not $hasExistingVirtualEnvironment) {
@@ -4799,6 +4807,43 @@ function Resolve-ProjectTypeSelection {
     }
 }
 
+function Get-ProjectDevelopmentPath {
+    param([Parameter(Mandatory = $true)][string] $ProjectPath)
+
+    $chemin = [System.IO.Path]::GetFullPath($ProjectPath).TrimEnd('\', '/')
+    $parent = Split-Path -Path $chemin -Parent
+    $nom = Split-Path -Path $chemin -Leaf
+    if ((Split-Path -Path $parent -Leaf) -eq "$nom - dev") {
+        return $parent
+    }
+    return $chemin
+}
+
+function Get-ProjectVirtualEnvironmentPath {
+    param([Parameter(Mandatory = $true)][string] $ProjectPath)
+    return Join-Path (Get-ProjectDevelopmentPath -ProjectPath $ProjectPath) '.venv'
+}
+
+function Initialize-ProjectDevelopmentFiles {
+    param([string] $ProjectPath, [string] $ProjectName, [string] $ProjectType)
+
+    $dossierDev = Get-ProjectDevelopmentPath -ProjectPath $ProjectPath
+    if ($dossierDev -eq [System.IO.Path]::GetFullPath($ProjectPath).TrimEnd('\', '/')) { return }
+    $variables = Get-ProjectTemplateVariables -ProjectName $ProjectName -ProjectType $ProjectType
+    foreach ($nomFichier in @('README DEV.md', 'roadmap dev.md')) {
+        $destination = Join-Path $dossierDev $nomFichier
+        if (-not (Test-Path -LiteralPath $destination)) {
+            $contenu = Get-ProjectModelContent -LogicalFileName $nomFichier -ProjectType $ProjectType -Variables $variables
+            Write-Utf8TextFile -Path $destination -Content $contenu
+        }
+    }
+    New-ProjectAgentsFile -ProjectPath $dossierDev -ProjectType $ProjectType | Out-Null
+    $fichierType = Join-Path $dossierDev 'type-projet.txt'
+    if (-not (Test-Path -LiteralPath $fichierType)) {
+        Write-Utf8TextFile -Path $fichierType -Content $ProjectType
+    }
+}
+
 function Resolve-ProjectTarget {
     param(
         [Parameter(Mandatory = $true)]
@@ -4812,6 +4857,10 @@ function Resolve-ProjectTarget {
 
     while ($true) {
         $projectPath = Join-Path -Path $ProjectsRootPath -ChildPath $resolvedProjectName
+        $nouveauChemin = Join-Path (Join-Path $ProjectsRootPath "$resolvedProjectName - dev") $resolvedProjectName
+        if (-not (Test-Path -LiteralPath $projectPath)) {
+            $projectPath = $nouveauChemin
+        }
 
         if (-not (Test-Path -LiteralPath $projectPath)) {
             return [PSCustomObject]@{
@@ -4859,10 +4908,11 @@ function New-ProjectDirectory {
         [string] $ProjectTypeLabel
     )
 
-    $targetPath = Join-Path -Path $ProjectsRootPath -ChildPath $ProjectName
+    $dossierDev = Join-Path $ProjectsRootPath "$ProjectName - dev"
+    $targetPath = Join-Path $dossierDev $ProjectName
     Write-Host "Type de projet sélectionné : $ProjectTypeLabel" -ForegroundColor Cyan
 
-    New-Item -ItemType Directory -Path $targetPath | Out-Null
+    New-Item -ItemType Directory -Path $targetPath -Force | Out-Null
     Write-Host "Projet créé : $targetPath" -ForegroundColor Green
     return $targetPath
 }
@@ -4971,13 +5021,19 @@ function Get-ProjectReadmeContent {
 
         [bool] $HasVirtualEnvironment = $false,
 
-        [string] $ProjectType = 'py'
+        [string] $ProjectType = 'py',
+
+        [string] $ProjectPath = ''
     )
 
-    return Get-ProjectModelContent `
+    $contenu = Get-ProjectModelContent `
         -LogicalFileName 'README.md' `
         -ProjectType $ProjectType `
         -Variables (Get-ProjectTemplateVariables -ProjectName $ProjectName -ProjectType $ProjectType -HasVirtualEnvironment $HasVirtualEnvironment)
+    if ($ProjectPath -and (Get-ProjectDevelopmentPath -ProjectPath $ProjectPath) -ne $ProjectPath) {
+        $contenu = $contenu.Replace('.\.venv', '..\.venv').Replace('venv .venv', 'venv ..\.venv').Replace('dossier `.venv`', 'dossier `../.venv`')
+    }
+    return $contenu
 }
 
 function New-ProjectReadme {
@@ -5000,7 +5056,7 @@ function New-ProjectReadme {
         return $readmePath
     }
 
-    $content = Get-ProjectReadmeContent -ProjectName $ProjectName -HasVirtualEnvironment $HasVirtualEnvironment -ProjectType $ProjectType
+    $content = Get-ProjectReadmeContent -ProjectName $ProjectName -HasVirtualEnvironment $HasVirtualEnvironment -ProjectType $ProjectType -ProjectPath $ProjectPath
     Write-Utf8TextFile -Path $readmePath -Content $content
     Write-Host "README créé : $readmePath" -ForegroundColor Green
     return $readmePath
@@ -5089,7 +5145,7 @@ function New-PythonProjectRequirementsFile {
         [datetime] $Date = (Get-Date)
     )
 
-    $requirementsFileName = Get-PythonRequirementsFileName -Date $Date
+    $requirementsFileName = if ((Get-ProjectDevelopmentPath -ProjectPath $ProjectPath) -ne $ProjectPath) { 'requirements.txt' } else { Get-PythonRequirementsFileName -Date $Date }
     $requirementsPath = Join-Path -Path $ProjectPath -ChildPath $requirementsFileName
 
     if (Test-Path -LiteralPath $requirementsPath) {
@@ -5285,7 +5341,7 @@ function Install-DjangoInVirtualEnvironment {
         [string] $DjangoVersion
     )
 
-    $venvPythonPath = Join-Path -Path $ProjectPath -ChildPath '.venv\Scripts\python.exe'
+    $venvPythonPath = Join-Path (Get-ProjectVirtualEnvironmentPath -ProjectPath $ProjectPath) 'Scripts\python.exe'
     if (-not (Test-Path -LiteralPath $venvPythonPath)) {
         throw "Le Python du venv est introuvable : $venvPythonPath"
     }
@@ -5316,6 +5372,29 @@ function Install-DjangoInVirtualEnvironment {
     Write-Host "Django $DjangoVersion installé dans le venv." -ForegroundColor Green
 }
 
+function New-ReusableDjangoApplication {
+    param([string] $ProjectPath, [string] $ProjectName)
+
+    $nomApplication = Get-NormalizedDjangoProjectName -ProjectName $ProjectName
+    $dossierApplication = Join-Path $ProjectPath $nomApplication
+    if (Test-Path -LiteralPath $dossierApplication) { return }
+    $python = Join-Path (Get-ProjectVirtualEnvironmentPath -ProjectPath $ProjectPath) 'Scripts\python.exe'
+    New-Item -ItemType Directory -Path $dossierApplication | Out-Null
+    $resultat = Invoke-ExternalExecutableCapture -ExecutablePath $python -Arguments @('-m', 'django', 'startapp', $nomApplication, $dossierApplication) -WaitMessage "Création de l'application Django $nomApplication"
+    if (-not $resultat.Success) { throw "Création de l'application Django impossible : $($resultat.ErrorMessage) $($resultat.OutputLines -join ' ')" }
+}
+
+function Register-ReusableDjangoApplication {
+    param([string] $ProjectPath, [string] $ProjectName, [string] $DjangoProjectName)
+
+    $nomApplication = Get-NormalizedDjangoProjectName -ProjectName $ProjectName
+    $variables = @{ PROJECT_NAME = $ProjectName.Replace("'", "\'"); DJANGO_APP_NAME = $nomApplication }
+    $ajout = Get-ProjectModelContent -LogicalFileName 'site-application.py' -ProjectType 'django-app' -Variables $variables
+    $reglages = Join-Path (Get-ProjectDevelopmentPath -ProjectPath $ProjectPath) "$DjangoProjectName\settings.py"
+    $contenu = [System.IO.File]::ReadAllText($reglages, [System.Text.Encoding]::UTF8)
+    Write-Utf8TextFile -Path $reglages -Content ($contenu + [Environment]::NewLine + $ajout)
+}
+
 function New-DjangoProjectStructure {
     param(
         [Parameter(Mandatory = $true)]
@@ -5336,7 +5415,7 @@ function New-DjangoProjectStructure {
         }
     }
 
-    $venvPythonPath = Join-Path -Path $ProjectPath -ChildPath '.venv\Scripts\python.exe'
+    $venvPythonPath = Join-Path (Get-ProjectVirtualEnvironmentPath -ProjectPath $ProjectPath) 'Scripts\python.exe'
     if (-not (Test-Path -LiteralPath $venvPythonPath)) {
         throw "Le Python du venv est introuvable : $venvPythonPath"
     }
@@ -5566,7 +5645,7 @@ function Get-RecommendedPythonVersionInfoFromProjectPath {
         }
     }
 
-    $venvScriptsPath = Join-Path -Path $ProjectPath -ChildPath '.venv\Scripts'
+    $venvScriptsPath = Join-Path (Get-ProjectVirtualEnvironmentPath -ProjectPath $ProjectPath) 'Scripts'
     if (-not (Test-Path -LiteralPath $venvScriptsPath)) {
         return [PSCustomObject]@{
             VersionRequest = $null
@@ -5769,7 +5848,7 @@ function New-PythonProjectCmdVenvLauncher {
         [string] $ProjectType = 'py'
     )
 
-    $launcherPath = Join-Path -Path $ProjectPath -ChildPath 'cmdVenv.cmd'
+    $launcherPath = Join-Path -Path (Get-ProjectDevelopmentPath -ProjectPath $ProjectPath) -ChildPath 'cmdVenv.cmd'
 
     if (Test-Path -LiteralPath $launcherPath) {
         Write-Host "cmdVenv.cmd déjà présent : $launcherPath" -ForegroundColor Yellow
@@ -7576,7 +7655,7 @@ function New-PythonVirtualEnvironment {
         [object] $PythonInterpreter
     )
 
-    $venvPath = Join-Path -Path $ProjectPath -ChildPath '.venv'
+    $venvPath = Get-ProjectVirtualEnvironmentPath -ProjectPath $ProjectPath
 
     if (Test-Path -LiteralPath $venvPath) {
         $item = Get-Item -LiteralPath $venvPath
@@ -7690,6 +7769,7 @@ try {
 
         switch ($gitHubExistingRepositoryAction) {
             'Import' {
+                New-Item -ItemType Directory -Path (Split-Path -Path $projectPath -Parent) -Force | Out-Null
                 Import-GitHubRepositoryToProjectPath `
                     -RepositoryFullName $existingRepositoryInfo.RepositoryFullName `
                     -ProjectPath $projectPath
@@ -7714,6 +7794,7 @@ try {
     }
 
     if ($projectWasImportedFromGitHub -and $null -ne $projectPath) {
+        Initialize-ProjectDevelopmentFiles -ProjectPath $projectPath -ProjectName $ProjectName -ProjectType (Get-DetectedExistingProjectType -ProjectPath $projectPath)
         $importedProjectSetupResult = Initialize-ImportedPythonProjectEnvironment `
             -ConfigPath $ConfigPath `
             -ProjectConfig $projectConfig `
@@ -7754,9 +7835,7 @@ try {
         New-ProjectGitIgnoreFile `
             -ProjectPath $projectPath `
             -ProjectType $ProjectType | Out-Null
-        New-ProjectAgentsFile `
-            -ProjectPath $projectPath `
-            -ProjectType $ProjectType | Out-Null
+        Initialize-ProjectDevelopmentFiles -ProjectPath $projectPath -ProjectName $ProjectName -ProjectType $ProjectType
 
         if (-not (Test-PythonBasedProjectType -ProjectType $ProjectType)) {
             New-ProjectReadme `
@@ -7769,7 +7848,13 @@ try {
             $createPythonVenv = $false
             $selectedPythonVersionRequest = $null
             $selectedDjangoVersion = $null
-            $createPythonVenv = Read-CreatePythonVenv -DefaultCreatePythonVenv $projectConfig.DefaultCreatePythonVenv
+            if ($ProjectType -eq 'django-app') {
+                Write-Host 'Un venv est nécessaire pour le site de développement de cette application Django.' -ForegroundColor Cyan
+                $createPythonVenv = $true
+            }
+            else {
+                $createPythonVenv = Read-CreatePythonVenv -DefaultCreatePythonVenv $projectConfig.DefaultCreatePythonVenv
+            }
 
             if ($createPythonVenv) {
                 Write-StepInfo 'Recherche des versions Python connues...'
@@ -7798,23 +7883,36 @@ try {
                 -ProjectName $ProjectName `
                 -ProjectType $ProjectType | Out-Null
 
-            if ($ProjectType -eq 'django') {
+            if ($ProjectType -in @('django', 'django-app')) {
                 if ($createPythonVenv) {
                     $availableDjangoVersions = @(Get-AvailableDjangoPackageVersions)
                     $selectedDjangoVersion = Read-DjangoVersionSelection -AvailableVersions $availableDjangoVersions
                     Install-DjangoInVirtualEnvironment -ProjectPath $projectPath -DjangoVersion $selectedDjangoVersion | Out-Null
-                    $defaultDjangoProjectName = Get-NormalizedDjangoProjectName -ProjectName $ProjectName
-                    $selectedDjangoProjectName = Ensure-DjangoProjectStructure -ProjectPath $projectPath -DefaultDjangoProjectName $defaultDjangoProjectName
+                    $defaultDjangoProjectName = (Get-NormalizedDjangoProjectName -ProjectName $ProjectName) + '_django'
+                    $cheminSiteDjango = $projectPath
+                    if ($ProjectType -eq 'django-app') {
+                        $cheminSiteDjango = Get-ProjectDevelopmentPath -ProjectPath $projectPath
+                        New-ReusableDjangoApplication -ProjectPath $projectPath -ProjectName $ProjectName
+                    }
+                    $selectedDjangoProjectName = Ensure-DjangoProjectStructure -ProjectPath $cheminSiteDjango -DefaultDjangoProjectName $defaultDjangoProjectName
                     Update-DjangoProjectSettingsFile `
-                        -ProjectPath $projectPath `
+                        -ProjectPath $cheminSiteDjango `
                         -DjangoProjectName $selectedDjangoProjectName `
                         -LanguageCode $projectConfig.DefaultDjangoLanguageCode `
                         -TimeZone $projectConfig.DefaultDjangoTimeZone | Out-Null
+                    if ($ProjectType -eq 'django-app') {
+                        Register-ReusableDjangoApplication -ProjectPath $projectPath -ProjectName $ProjectName -DjangoProjectName $selectedDjangoProjectName
+                    }
                 }
                 else {
                     Write-Host 'Aucun venv créé : l''installation automatique de Django est ignorée.' -ForegroundColor Yellow
                 }
             }
+        }
+
+        if ($null -ne (Get-GitCommand)) {
+            $initialisationGit = Invoke-GitCommandCapture -Arguments @('-C', $projectPath, 'init') -WaitMessage 'Initialisation du dépôt Git dans le dossier du projet'
+            if (-not $initialisationGit.Success) { throw 'Impossible de créer le dépôt Git du projet.' }
         }
 
         if ($canCreateGitHubRepository) {

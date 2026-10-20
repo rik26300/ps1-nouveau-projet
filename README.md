@@ -22,9 +22,44 @@ Le script connaît actuellement les types suivants :
 - `ps1`
 - `py`
 - `django`
+- `django-app` : application Django réutilisable, avec un site de test local
 - `autre`
 
 Les projets `django` héritent des règles et fichiers Python, avec leur couche spécifique en plus.
+
+## Organisation des nouveaux projets (version 3.0.0)
+
+```text
+MonProjet - dev/
+├── AGENTS.md
+├── README DEV.md
+├── roadmap dev.md
+├── type-projet.txt
+├── .venv/                  (projets Python avec environnement local)
+├── cmdVenv.cmd             (projets Python)
+└── MonProjet/              (racine du dépôt Git)
+    ├── README.md
+    ├── .gitignore
+    ├── requirements.txt    (projets Python)
+    ├── pyproject.toml      (projets Python)
+    └── code du projet
+```
+
+Les outils personnels et les documents placés dans le dossier parent restent hors
+du dépôt Git. Exécuter les commandes Git dans `MonProjet/`. Le venv est local :
+sur une machine de production, recréer l'environnement et installer les dépendances.
+`pyproject.toml` reste versionné car il décrit aussi l'installation du projet.
+
+Pour `django`, `manage.py` et le module de configuration `monprojet_django/`
+sont dans le dossier versionné. Pour `django-app`, le paquet de l'application
+est versionné, mais `manage.py`, le module de configuration et la base du site
+de test restent dans le dossier `MonProjet - dev/`. Le venv est obligatoire
+pour créer ce site de développement ; l'application y est enregistrée.
+
+La mise à jour reconnaît les anciennes et nouvelles structures. Elle ne déplace
+pas les projets existants ; leurs fichiers de dépendances datés sont conservés.
+La commande `-UpdateScript` met uniquement à jour le générateur et ses ressources.
+Les fichiers de développement proviennent aussi de modèles personnalisables.
 
 ## Architecture du dépôt
 
