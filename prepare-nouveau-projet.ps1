@@ -10,7 +10,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = [Version] '3.0.0'
+$ScriptVersion = [Version] '3.1.0'
 $CurrentConfigVersion = 13
 $LegacyConfigVersion = 1
 $ConfigFileName = 'prepare-nouveau-projet.config.json'
@@ -3417,15 +3417,16 @@ function Get-ImportedPythonProjectSetupPlan {
     }
 
     if ($finalHasVirtualEnvironment) {
-        $cmdVenvPath = Join-Path -Path (Get-ProjectDevelopmentPath -ProjectPath $ProjectPath) -ChildPath 'cmdVenv.cmd'
-        $expectedCmdVenvContent = Get-PythonProjectCmdVenvLauncherContent -ProjectName $ProjectName -ProjectType $ProjectType
+      foreach ($nomLanceur in @('cmdVenv.cmd', 'cmdVenv.ps1')) {
+        $cmdVenvPath = Join-Path -Path (Get-ProjectDevelopmentPath -ProjectPath $ProjectPath) -ChildPath $nomLanceur
+        $expectedCmdVenvContent = Get-PythonProjectCmdVenvLauncherContent -ProjectName $ProjectName -ProjectType $ProjectType -NomFichier $nomLanceur
         if (-not (Test-Path -LiteralPath $cmdVenvPath)) {
             $changes.Add([PSCustomObject]@{
                     Type = 'WriteFile'
                     Path = $cmdVenvPath
-                    Description = 'Créer cmdVenv.cmd'
+                    Description = "Créer $nomLanceur"
                     Content = $expectedCmdVenvContent
-                    WithoutBom = $true
+                    WithoutBom = ($nomLanceur -eq 'cmdVenv.cmd')
                     Category = 'Venv'
                 })
         }
@@ -3433,12 +3434,13 @@ function Get-ImportedPythonProjectSetupPlan {
             $changes.Add([PSCustomObject]@{
                     Type = 'WriteFile'
                     Path = $cmdVenvPath
-                    Description = 'Mettre à jour cmdVenv.cmd'
+                    Description = "Mettre à jour $nomLanceur"
                     Content = $expectedCmdVenvContent
-                    WithoutBom = $true
+                    WithoutBom = ($nomLanceur -eq 'cmdVenv.cmd')
                     Category = 'Venv'
                 })
         }
+      }
     }
 
     if ($WillCreateVirtualEnvironment) {
@@ -5828,11 +5830,14 @@ function Get-PythonProjectCmdVenvLauncherContent {
         [Parameter(Mandatory = $true)]
         [string] $ProjectName,
 
-        [string] $ProjectType = 'py'
+        [string] $ProjectType = 'py',
+
+        [ValidateSet('cmdVenv.cmd', 'cmdVenv.ps1')]
+        [string] $NomFichier = 'cmdVenv.cmd'
     )
 
     return Get-ProjectModelContent `
-        -LogicalFileName 'cmdVenv.cmd' `
+        -LogicalFileName $NomFichier `
         -ProjectType $ProjectType `
         -Variables (Get-ProjectTemplateVariables -ProjectName $ProjectName -ProjectType $ProjectType)
 }
@@ -5848,17 +5853,20 @@ function New-PythonProjectCmdVenvLauncher {
         [string] $ProjectType = 'py'
     )
 
-    $launcherPath = Join-Path -Path (Get-ProjectDevelopmentPath -ProjectPath $ProjectPath) -ChildPath 'cmdVenv.cmd'
+  foreach ($nomLanceur in @('cmdVenv.cmd', 'cmdVenv.ps1')) {
+    $launcherPath = Join-Path -Path (Get-ProjectDevelopmentPath -ProjectPath $ProjectPath) -ChildPath $nomLanceur
 
     if (Test-Path -LiteralPath $launcherPath) {
-        Write-Host "cmdVenv.cmd déjà présent : $launcherPath" -ForegroundColor Yellow
-        return $launcherPath
+        Write-Host "$nomLanceur déjà présent : $launcherPath" -ForegroundColor Yellow
+        Write-Output $launcherPath
+        continue
     }
 
-    $content = Get-PythonProjectCmdVenvLauncherContent -ProjectName $ProjectName -ProjectType $ProjectType
-    Write-Utf8TextFile -Path $launcherPath -Content $content -WithoutBom
-    Write-Host "cmdVenv.cmd créé : $launcherPath" -ForegroundColor Green
-    return $launcherPath
+    $content = Get-PythonProjectCmdVenvLauncherContent -ProjectName $ProjectName -ProjectType $ProjectType -NomFichier $nomLanceur
+    Write-Utf8TextFile -Path $launcherPath -Content $content -WithoutBom:($nomLanceur -eq 'cmdVenv.cmd')
+    Write-Host "$nomLanceur créé : $launcherPath" -ForegroundColor Green
+    Write-Output $launcherPath
+  }
 }
 
 function Invoke-ExternalExecutableCapture {

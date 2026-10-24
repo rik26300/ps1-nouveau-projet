@@ -6,7 +6,8 @@ Les outils personnels, `.venv`, `AGENTS.md` et la feuille de route restent hors 
 
 ## Python
 
-Si un environnement Python a été créé, lancer `cmdVenv.cmd` ou activer
+Si un environnement Python a été créé, lancer `cmdVenv.cmd` pour CMD,
+`cmdVenv.ps1` pour PowerShell, ou activer
 `.venv/Scripts/Activate.ps1` depuis ce dossier. Le code, les dépendances et
 `pyproject.toml` restent dans le sous-dossier du projet.
 

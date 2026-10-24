@@ -37,6 +37,7 @@ MonProjet - dev/
 ├── type-projet.txt
 ├── .venv/                  (projets Python avec environnement local)
 ├── cmdVenv.cmd             (projets Python)
+├── cmdVenv.ps1             (session PowerShell avec le venv activé)
 └── MonProjet/              (racine du dépôt Git)
     ├── README.md
     ├── .gitignore
