@@ -10,7 +10,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = [Version] '3.1.0'
+$ScriptVersion = [Version] '3.2.0'
 $CurrentConfigVersion = 13
 $LegacyConfigVersion = 1
 $ConfigFileName = 'prepare-nouveau-projet.config.json'
@@ -3443,6 +3443,20 @@ function Get-ImportedPythonProjectSetupPlan {
       }
     }
 
+    if ($ProjectType -in @('django', 'django-app')) {
+        $dossierDev = Get-ProjectDevelopmentPath -ProjectPath $ProjectPath
+        $lanceurServeur = Join-Path $dossierDev 'start serveur.bat'
+        if (-not (Test-Path -LiteralPath $lanceurServeur)) {
+            $changes.Add([PSCustomObject]@{
+                    Type = 'WriteFile'
+                    Path = $lanceurServeur
+                    Description = 'Créer start serveur.bat'
+                    Content = (Get-DjangoServerLauncherContent -ProjectPath $ProjectPath -ProjectName $ProjectName -ProjectType $ProjectType)
+                    WithoutBom = $true
+                })
+        }
+    }
+
     if ($WillCreateVirtualEnvironment) {
         $changes.Add([PSCustomObject]@{
                 Type = 'CreateVenv'
@@ -4826,6 +4840,17 @@ function Get-ProjectVirtualEnvironmentPath {
     return Join-Path (Get-ProjectDevelopmentPath -ProjectPath $ProjectPath) '.venv'
 }
 
+function Get-DjangoServerLauncherContent {
+    param([string] $ProjectPath, [string] $ProjectName, [string] $ProjectType)
+
+    $dossierDev = Get-ProjectDevelopmentPath -ProjectPath $ProjectPath
+    $cheminSite = if ($ProjectType -eq 'django-app' -or $dossierDev -eq $ProjectPath) { '.' } else { $ProjectName }
+    $variables = Get-ProjectTemplateVariables -ProjectName $ProjectName -ProjectType $ProjectType
+    $variables['DJANGO_SITE_PATH'] = $cheminSite
+    $contenu = Get-ProjectModelContent -LogicalFileName 'start serveur.bat' -ProjectType $ProjectType -Variables $variables
+    return ($contenu -replace "`r?`n", "`r`n")
+}
+
 function Initialize-ProjectDevelopmentFiles {
     param([string] $ProjectPath, [string] $ProjectName, [string] $ProjectType)
 
@@ -4840,6 +4865,13 @@ function Initialize-ProjectDevelopmentFiles {
         }
     }
     New-ProjectAgentsFile -ProjectPath $dossierDev -ProjectType $ProjectType | Out-Null
+    if ($ProjectType -in @('django', 'django-app')) {
+        $lanceurServeur = Join-Path $dossierDev 'start serveur.bat'
+        if (-not (Test-Path -LiteralPath $lanceurServeur)) {
+            $contenu = Get-DjangoServerLauncherContent -ProjectPath $ProjectPath -ProjectName $ProjectName -ProjectType $ProjectType
+            Write-Utf8TextFile -Path $lanceurServeur -Content $contenu -WithoutBom
+        }
+    }
     $fichierType = Join-Path $dossierDev 'type-projet.txt'
     if (-not (Test-Path -LiteralPath $fichierType)) {
         Write-Utf8TextFile -Path $fichierType -Content $ProjectType

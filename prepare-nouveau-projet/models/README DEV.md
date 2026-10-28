@@ -19,3 +19,7 @@ se trouvent ici. L'application est enregistrée dans ce site de développement.
 
 Les fichiers de ce dossier sont locaux et doivent être sauvegardés séparément
 si nécessaire. Seul le contenu du sous-dossier du projet est publié sur Git.
+
+Pour Django, lancer `start serveur.bat` sur une machine avec `MACHINE=dev`.
+Il applique les migrations puis démarre le serveur sur `127.0.0.1:8000`.
+Avec `start serveur.bat --verifier`, il vérifie le site sans appliquer les migrations.
